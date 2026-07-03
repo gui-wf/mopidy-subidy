@@ -62,6 +62,43 @@ In addition, the following optional configuration values are supported:
   once the track has been played for at least half its length or four minutes,
   whichever comes first (the standard AudioScrobbler rule).
 
+- ``radio_size`` -- Defaults to ``50`` (allowed range 1-500). Number of songs
+  returned by the algorithmic-radio surfaces (see below): the ``Radio`` /
+  ``Random Songs`` dir, per-artist ``Similar Songs`` / ``Top Songs`` and
+  per-album ``Similar Songs``. Also governs the random-songs browse and the
+  ``comment=random`` search.
+
+
+Radio and instant-mix
+====================
+
+Mopidy-Subidy exposes the server's algorithmic recommendations as ordinary
+browsable, queue-able directories - navigate into one from any MPD client
+(e.g. ncmpcpp) and add-and-play the songs it lists:
+
+- A top-level **Radio** directory with a **Random Songs** child, backed by
+  ``getRandomSongs``. It is re-fetched on every browse, so it is genuinely
+  random each time (never cached).
+
+- When browsing an **artist**, two extra entries lead the listing:
+
+  - **Similar Songs** - ``getSimilarSongs2`` for the artist id.
+  - **Top Songs** - ``getTopSongs`` for the artist name (shown only when the
+    server reports the artist's name).
+
+- When browsing an **album**, a **Similar Songs** entry (``getSimilarSongs2``
+  on the album id) provides a "more like this" instant-mix.
+
+The number of songs each surface returns is controlled by ``radio_size``.
+
+**Empty dirs are normal on some servers.** ``getSimilarSongs2`` and
+``getTopSongs`` rely on the server's recommendation data (MusicBrainz IDs and a
+configured agent such as Last.fm / Spotify / ListenBrainz). Servers like
+Navidrome frequently return nothing for artists that lack MusicBrainz IDs, so
+an empty **Similar Songs** / **Top Songs** directory is expected behaviour, not
+a fault. A network or server failure likewise yields an empty dir and never
+interrupts playback.
+
 
 Starred / loved content
 =======================
@@ -111,6 +148,8 @@ The following things are supported:
 - Browsing, creating, editing and deleting playlists
 - Searching explicitly for one of: artists, albums, tracks
 - Browsing starred content and starring/unstarring tracks (see above)
+- Algorithmic radio / instant-mix: random songs, per-artist similar/top songs,
+  per-album similar songs (see above)
 
 The following things are **not** supported:
 

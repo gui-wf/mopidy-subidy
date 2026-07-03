@@ -14,7 +14,8 @@ class SubidyLibraryProvider(backend.LibraryProvider):
             dict(id="artists", name="Artists"),
             dict(id="albums", name="Albums"),
             dict(id="rootdirs", name="Directories"),
-            dict(id="random", name="Random"),
+            dict(id="radio", name="Radio"),
+            dict(id="random", name="Random Songs"),
             dict(id=subsonic_api.RESERVED_STARRED_ID, name="Starred"),
         ]
         # Create a dict with the keys being the `id`s in `vdir_templates`
@@ -56,6 +57,62 @@ class SubidyLibraryProvider(backend.LibraryProvider):
 
     def browse_random_songs(self):
         return self.subsonic_api.get_random_songs_as_refs()
+
+    def browse_radio(self):
+        """List the algorithmic-radio surfaces under the top-level Radio dir.
+
+        Currently a single 'Random Songs' child backed by getRandomSongs; it
+        is the discoverable home for the global mix surfaces. The child is a
+        directory ref browsed on demand (stays random per browse - nothing is
+        cached).
+        """
+        return [self._raw_vdir_to_ref(self._vdirs["random"])]
+
+    def browse_artist(self, artist_id):
+        """Browse an artist: two radio entries, then the albums.
+
+        Fetches getArtist exactly ONCE and derives both the album refs and the
+        artist name from that single response (no second round-trip). The two
+        radio dirs (Similar Songs, Top Songs) lead the listing deterministically
+        so the ordering is stable across servers; the albums follow, already
+        name-sorted by the subsonic_api helper.
+
+        - Similar Songs: getSimilarSongs2(artist_id), id-based, always shown.
+        - Top Songs: getTopSongs(artist_name), name-based - only shown when the
+          artist name is known (else the entry is skipped rather than issuing
+          getTopSongs with an empty name).
+
+        On a failed getArtist the name is None (Top Songs skipped) and the
+        album list is empty; Similar Songs still resolves off the id. Never
+        raises - the underlying helpers degrade to empty lists.
+        """
+        raw_artist = self.subsonic_api.get_raw_artist(artist_id)
+        artist_name = raw_artist.get("name") if raw_artist else None
+        radio_refs = [
+            Ref.directory(
+                name="Similar Songs", uri=uri.get_similar_uri(artist_id)
+            )
+        ]
+        if artist_name:
+            radio_refs.append(
+                Ref.directory(
+                    name="Top Songs", uri=uri.get_top_uri(artist_name)
+                )
+            )
+        album_refs = self.subsonic_api.get_albums_as_refs_from_raw(raw_artist)
+        return radio_refs + album_refs
+
+    def browse_album(self, album_id):
+        """Browse an album: a Similar Songs radio entry, then the songs.
+
+        getSimilarSongs2 accepts an album id, so the same helper delivers the
+        goal's per-album instant-mix. The radio entry leads the listing; the
+        album's own songs follow.
+        """
+        radio_ref = Ref.directory(
+            name="Similar Songs", uri=uri.get_similar_uri(album_id)
+        )
+        return [radio_ref] + self.browse_songs(album_id)
 
     def browse_starred(self):
         """Read-only mirror of the server's starred content.
@@ -103,7 +160,7 @@ class SubidyLibraryProvider(backend.LibraryProvider):
                 "rootdirs",
                 "artists",
                 "albums",
-                "random",
+                "radio",
                 subsonic_api.RESERVED_STARRED_ID,
             ]
             root_vdirs = [
@@ -119,6 +176,8 @@ class SubidyLibraryProvider(backend.LibraryProvider):
             return self.browse_artists()
         elif browse_uri == uri.get_vdir_uri("albums"):
             return self.browse_albums()
+        elif browse_uri == uri.get_vdir_uri("radio"):
+            return self.browse_radio()
         elif browse_uri == uri.get_vdir_uri("random"):
             return self.browse_random_songs()
         elif browse_uri == uri.get_vdir_uri(subsonic_api.RESERVED_STARRED_ID):
@@ -129,9 +188,22 @@ class SubidyLibraryProvider(backend.LibraryProvider):
             if uri_type == uri.DIRECTORY:
                 return self.browse_diritems(uri.get_directory_id(browse_uri))
             elif uri_type == uri.ARTIST:
-                return self.browse_albums(uri.get_artist_id(browse_uri))
+                return self.browse_artist(uri.get_artist_id(browse_uri))
             elif uri_type == uri.ALBUM:
-                return self.browse_songs(uri.get_album_id(browse_uri))
+                return self.browse_album(uri.get_album_id(browse_uri))
+            elif uri_type == uri.SIMILAR:
+                # A hand-crafted bare 'subidy:similar:' yields a None id; skip
+                # the fetch rather than call getSimilarSongs2 with None.
+                similar_id = uri.get_similar_id(browse_uri)
+                if similar_id is None:
+                    return []
+                return self.subsonic_api.get_similar_songs_as_refs(similar_id)
+            elif uri_type == uri.TOP:
+                # Same guard for a bare 'subidy:top:' (None artist name).
+                top_id = uri.get_top_id(browse_uri)
+                if top_id is None:
+                    return []
+                return self.subsonic_api.get_top_songs_as_refs(top_id)
             else:
                 return []
 
@@ -149,11 +221,14 @@ class SubidyLibraryProvider(backend.LibraryProvider):
             return self.lookup_playlist(uri.get_playlist_id(lookup_uri))
 
     def lookup(self, uri=None, uris=None):
+        # lookup_one returns None for a directory-only uri type (e.g. SIMILAR/
+        # TOP radio dirs, which have no track lookup); mopidy's contract is
+        # that lookup returns a list, so coerce None to [].
         if uris is not None:
-            return {uri: self.lookup_one(uri) for uri in uris}
+            return {uri: (self.lookup_one(uri) or []) for uri in uris}
         if uri is not None:
-            return self.lookup_one(uri)
-        return None
+            return self.lookup_one(uri) or []
+        return []
 
     def get_images(self, uris):
         """Return cover-art images for song/album/artist URIs.

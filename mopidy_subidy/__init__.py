@@ -24,6 +24,14 @@ class SubidyExtension(ext.Extension):
         schema["legacy_auth"] = config.Boolean(optional=True)
         schema["api_version"] = config.String(optional=True)
         schema["scrobbling"] = config.Boolean(optional=True)
+        # Number of songs the algorithmic-radio surfaces return per browse
+        # (Random Songs, per-artist Similar/Top Songs, per-album Similar).
+        # Subsonic's getRandomSongs caps at 500. Integer(optional=True, ...)
+        # REJECTS an out-of-range value at load (it does not clamp); ext.conf
+        # ships a default of 50, so the value is effectively always present.
+        schema["radio_size"] = config.Integer(
+            optional=True, minimum=1, maximum=500
+        )
         return schema
 
     def setup(self, registry):

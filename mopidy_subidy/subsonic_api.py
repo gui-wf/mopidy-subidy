@@ -19,6 +19,14 @@ UNKNOWN_ARTIST = "Unknown Artist"
 MAX_SEARCH_RESULTS = 100
 MAX_LIST_RESULTS = 500
 
+# Number of songs an algorithmic-radio surface (Random Songs, per-artist
+# Similar/Top Songs) returns per browse. Configurable via the `radio_size`
+# config key; this is the fallback when the key is absent or explicitly empty
+# (config.Integer(minimum=1, maximum=500) REJECTS out-of-range values at load
+# rather than clamping, so a bad value never reaches here). Kept modest so a
+# radio browse stays responsive.
+RADIO_SIZE_DEFAULT = 50
+
 # Stable cover-art size (px) requested from getCoverArt. Kept as a plain
 # constant rather than a config key to keep the extension's footprint small;
 # the value is baked into the image URL so a given track always yields the
@@ -90,8 +98,19 @@ def diritem_sort_key(item):
 
 class SubsonicApi:
     def __init__(
-        self, url, username, password, app_name, legacy_auth, api_version
+        self,
+        url,
+        username,
+        password,
+        app_name,
+        legacy_auth,
+        api_version,
+        radio_size=None,
     ):
+        # radio_size may be None (config key absent/empty); coerce to the
+        # module default. A present value is already validated 1..500 by the
+        # config schema, so no clamping is needed here.
+        self.radio_size = radio_size or RADIO_SIZE_DEFAULT
         parsed = urlparse(url)
         self.port = (
             parsed.port
@@ -700,21 +719,37 @@ class SubsonicApi:
             return sorted(diritems, key=diritem_sort_key)
         return None
 
-    def get_raw_albums(self, artist_id):
+    def get_raw_artist(self, artist_id):
+        """Return the raw ID3 artist object from getArtist, or None on failure.
+
+        The returned dict carries BOTH the artist ``name`` AND its ``album``
+        list side by side, so a single getArtist round-trip feeds both the
+        album listing and the per-artist Top Songs name (see browse_artist in
+        library.py). Same resilience shape as the other get_raw_* helpers: a
+        network/server failure is logged and yields None, never raises.
+        """
         try:
             response = self.connection.getArtist(artist_id)
         except Exception:
             logger.warning(
-                "Connecting to subsonic failed when loading list of albums."
+                "Connecting to subsonic failed when loading artist."
             )
-            return []
+            return None
         if response.get("status") != RESPONSE_OK:
             logger.warning(
                 "Got non-okay status code from subsonic: %s"
                 % response.get("status")
             )
-            return []
-        albums = response.get("artist").get("album")
+            return None
+        return response.get("artist")
+
+    def get_raw_albums(self, artist_id):
+        artist = self.get_raw_artist(artist_id)
+        return self._raw_artist_albums(artist)
+
+    def _raw_artist_albums(self, artist):
+        """Extract and name-sort the album list from a raw artist object."""
+        albums = artist.get("album") if artist is not None else None
         if albums is not None:
             return sorted(
                 albums,
@@ -736,10 +771,12 @@ class SubsonicApi:
                 % response.get("status")
             )
             return []
-        songs = response.get("album").get("song")
-        if songs is not None:
-            return songs
-        return []
+        # album may be None on a status-ok-but-empty response; guard the
+        # chained .get so it never raises AttributeError.
+        album = response.get("album")
+        if not album:
+            return []
+        return album.get("song") or []
 
     def get_raw_random_song(self, size=MAX_LIST_RESULTS):
         try:
@@ -755,10 +792,93 @@ class SubsonicApi:
                 % response.get("status")
             )
             return []
-        songs = response.get("randomSongs").get("song")
-        if songs is not None:
-            return songs
-        return []
+        # randomSongs may be None on a status-ok-but-empty response; guard the
+        # chained .get so it never raises AttributeError.
+        random_songs = response.get("randomSongs")
+        if not random_songs:
+            return []
+        return random_songs.get("song") or []
+
+    def get_raw_similar_songs(self, iid, count=None):
+        """Return the getSimilarSongs2 song list for an artist/album/song id.
+
+        getSimilarSongs2 accepts an artist, album OR song id, so this one
+        helper backs the per-artist, per-album (and any future per-song)
+        instant-mix. On any failure (network, unsupported server, non-ok
+        status - py-sonic's _checkStatus raises first, so the status guard
+        below is defensive/dead but kept for consistency) it logs and returns
+        []. The result is run through _as_list because some servers emit a
+        single similar song as a bare object, not a one-element array.
+        """
+        try:
+            response = self.connection.getSimilarSongs2(
+                iid, count or self.radio_size
+            )
+        except Exception:
+            logger.warning(
+                "Connecting to subsonic failed when loading similar songs."
+            )
+            return []
+        if response.get("status") != RESPONSE_OK:
+            logger.warning(
+                "Got non-okay status code from subsonic: %s"
+                % response.get("status")
+            )
+            return []
+        # similarSongs2 may be absent OR present-but-None on a status-ok empty
+        # response; guard the chained .get so it never raises AttributeError.
+        payload = response.get("similarSongs2")
+        if not payload:
+            return []
+        return _as_list(payload.get("song"))
+
+    def get_raw_top_songs(self, artist_name, count=None):
+        """Return the getTopSongs song list for an artist NAME.
+
+        getTopSongs takes the artist name string (not an id). Same resilience
+        and single-object-not-a-list coercion as get_raw_similar_songs.
+        """
+        try:
+            response = self.connection.getTopSongs(
+                artist_name, count or self.radio_size
+            )
+        except Exception:
+            logger.warning(
+                "Connecting to subsonic failed when loading top songs."
+            )
+            return []
+        if response.get("status") != RESPONSE_OK:
+            logger.warning(
+                "Got non-okay status code from subsonic: %s"
+                % response.get("status")
+            )
+            return []
+        # topSongs may be absent OR present-but-None on a status-ok empty
+        # response; guard the chained .get so it never raises AttributeError.
+        payload = response.get("topSongs")
+        if not payload:
+            return []
+        return _as_list(payload.get("song"))
+
+    def get_similar_songs_as_refs(self, iid):
+        return [
+            ref
+            for ref in (
+                self.raw_song_to_ref(song)
+                for song in self.get_raw_similar_songs(iid)
+            )
+            if ref is not None
+        ]
+
+    def get_top_songs_as_refs(self, artist_name):
+        return [
+            ref
+            for ref in (
+                self.raw_song_to_ref(song)
+                for song in self.get_raw_top_songs(artist_name)
+            )
+            if ref is not None
+        ]
 
     def get_more_albums(self, ltype, size=MAX_LIST_RESULTS, offset=0):
         try:
@@ -807,6 +927,22 @@ class SubsonicApi:
         )
         return [self.raw_album_to_ref(album) for album in albums]
 
+    def get_albums_as_refs_from_raw(self, raw_artist):
+        """Album refs from an already-fetched raw artist object.
+
+        Lets library.browse_artist reuse the SAME getArtist response for both
+        the album listing and the artist name, avoiding a second getArtist
+        round-trip on the hot artist-browse path.
+        """
+        return [
+            ref
+            for ref in (
+                self.raw_album_to_ref(album)
+                for album in self._raw_artist_albums(raw_artist)
+            )
+            if ref is not None
+        ]
+
     def get_albums_as_albums(self, artist_id):
         return [
             self.raw_album_to_album(album)
@@ -815,13 +951,22 @@ class SubsonicApi:
 
     def get_songs_as_refs(self, album_id):
         return [
-            self.raw_song_to_ref(song) for song in self.get_raw_songs(album_id)
+            ref
+            for ref in (
+                self.raw_song_to_ref(song)
+                for song in self.get_raw_songs(album_id)
+            )
+            if ref is not None
         ]
 
     def get_songs_as_tracks(self, album_id):
         return [
-            self.raw_song_to_track(song)
-            for song in self.get_raw_songs(album_id)
+            track
+            for track in (
+                self.raw_song_to_track(song)
+                for song in self.get_raw_songs(album_id)
+            )
+            if track is not None
         ]
 
     def get_artists_as_refs(self):
@@ -837,22 +982,42 @@ class SubsonicApi:
 
     def get_diritems_as_refs(self, directory_id):
         return [
-            (
-                self.raw_directory_to_ref(diritem)
-                if diritem.get("isDir")
-                else self.raw_song_to_ref(diritem)
+            ref
+            for ref in (
+                (
+                    self.raw_directory_to_ref(diritem)
+                    if diritem.get("isDir")
+                    else self.raw_song_to_ref(diritem)
+                )
+                for diritem in self.get_raw_dir(directory_id)
             )
-            for diritem in self.get_raw_dir(directory_id)
+            if ref is not None
         ]
 
     def get_random_songs_as_refs(self):
+        # Radio surfaces (random/similar/top) share the configurable
+        # radio_size knob. This deliberately replaces the previous hardcoded
+        # 75; the browse stays fresh (uncached) - every call re-hits
+        # getRandomSongs, so it is random per browse by construction.
         return [
-            self.raw_song_to_ref(song) for song in self.get_raw_random_song(75)
+            ref
+            for ref in (
+                self.raw_song_to_ref(song)
+                for song in self.get_raw_random_song(self.radio_size)
+            )
+            if ref is not None
         ]
 
     def get_random_songs_as_tracks(self):
+        # Search comment=random path. Also governed by radio_size (previously
+        # the 500-default MAX_LIST_RESULTS) so the single knob is consistent.
         return [
-            self.raw_song_to_track(song) for song in self.get_raw_random_song()
+            track
+            for track in (
+                self.raw_song_to_track(song)
+                for song in self.get_raw_random_song(self.radio_size)
+            )
+            if track is not None
         ]
 
     def get_artists_as_artists(self):
@@ -903,7 +1068,9 @@ class SubsonicApi:
                 yield self.raw_song_to_track(item)
 
     def raw_song_to_ref(self, song):
-        if song is None:
+        # Skip a song dict with no id: a 'subidy:song:None' ref is unplayable,
+        # so callers filter these Nones out of similar/top/random dirs.
+        if not song or not song.get("id"):
             return None
         return Ref.track(
             name=song.get("title") or UNKNOWN_SONG,
@@ -911,7 +1078,9 @@ class SubsonicApi:
         )
 
     def raw_song_to_track(self, song):
-        if song is None:
+        # Skip a song dict with no id (see raw_song_to_ref) - a
+        # 'subidy:song:None' track is unplayable.
+        if not song or not song.get("id"):
             return None
         song_uri = uri.get_song_uri(song.get("id"))
         # Pre-populate the cover-art cache so get_images resolves this track

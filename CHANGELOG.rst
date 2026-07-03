@@ -3,6 +3,27 @@ Changelog
 *********
 
 
+Unreleased
+==========
+
+- Add algorithmic radio / instant-mix as browsable, queue-able content:
+
+  - A top-level ``Radio`` browse dir with a ``Random Songs`` child backed by
+    ``getRandomSongs`` (random per browse, never cached).
+  - Per-artist ``Similar Songs`` (``getSimilarSongs2``) and ``Top Songs``
+    (``getTopSongs``) entries when browsing an artist.
+  - Per-album ``Similar Songs`` instant-mix (``getSimilarSongs2`` on the album
+    id) when browsing an album.
+
+  Every entry yields real, playable ``subidy:song`` refs. Network failures are
+  logged and yield an empty dir - playback is never interrupted.
+
+- Add a ``radio_size`` config key (default 50, range 1-500) governing how many
+  songs the radio surfaces return. This also now governs the random-songs
+  browse (previously a hardcoded 75) and the ``comment=random`` search
+  (previously up to 500), unifying them onto one knob.
+
+
 v1.0.0 (2020-03-13)
 ===================
 
