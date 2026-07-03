@@ -15,6 +15,7 @@ class SubidyLibraryProvider(backend.LibraryProvider):
             dict(id="albums", name="Albums"),
             dict(id="rootdirs", name="Directories"),
             dict(id="random", name="Random"),
+            dict(id=subsonic_api.RESERVED_STARRED_ID, name="Starred"),
         ]
         # Create a dict with the keys being the `id`s in `vdir_templates`
         # and the values being objects containing the vdir `id`,
@@ -56,6 +57,18 @@ class SubidyLibraryProvider(backend.LibraryProvider):
     def browse_random_songs(self):
         return self.subsonic_api.get_random_songs_as_refs()
 
+    def browse_starred(self):
+        """Read-only mirror of the server's starred content.
+
+        Concatenates starred artists, albums and songs as refs. All three come
+        from a single cached getStarred2 payload (see fetch_starred), so this
+        is one round-trip, not three. Browsing an album/artist ref from here
+        reuses the existing ARTIST/ALBUM browse branches unchanged. On network
+        failure the underlying helpers yield empty lists, so the dir is simply
+        empty - never an error.
+        """
+        return self.subsonic_api.get_starred_as_refs()
+
     def browse_diritems(self, directory_id):
         return self.subsonic_api.get_diritems_as_refs(directory_id)
 
@@ -86,7 +99,13 @@ class SubidyLibraryProvider(backend.LibraryProvider):
 
     def browse(self, browse_uri):
         if browse_uri == uri.get_vdir_uri("root"):
-            root_vdir_names = ["rootdirs", "artists", "albums", "random"]
+            root_vdir_names = [
+                "rootdirs",
+                "artists",
+                "albums",
+                "random",
+                subsonic_api.RESERVED_STARRED_ID,
+            ]
             root_vdirs = [
                 self._vdirs[vdir_name] for vdir_name in root_vdir_names
             ]
@@ -102,6 +121,8 @@ class SubidyLibraryProvider(backend.LibraryProvider):
             return self.browse_albums()
         elif browse_uri == uri.get_vdir_uri("random"):
             return self.browse_random_songs()
+        elif browse_uri == uri.get_vdir_uri(subsonic_api.RESERVED_STARRED_ID):
+            return self.browse_starred()
 
         else:
             uri_type = uri.get_type(browse_uri)

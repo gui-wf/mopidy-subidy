@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import time
 from collections import OrderedDict
 from hashlib import md5
 from urllib.parse import urlencode, urlparse
@@ -29,9 +30,42 @@ DEFAULT_IMAGE_SIZE = 600
 # a URL that was handed out stays stable as long as it is still in use.
 COVER_ART_CACHE_MAX = 4096
 
+# Reserved playlist/vdir id for the "starred" surfaces. Defined once here and
+# imported by library.py and playlists.py so the magic string cannot drift.
+# Subsonic server playlist ids are numeric/uuid and never this literal, so an
+# exact-match guard against it never collides with a real playlist.
+RESERVED_STARRED_ID = "starred"
+
+# The getStarred2 payload is fetched at most once per this many seconds and
+# reused within a single logical operation (a browse of the Starred dir reads
+# songs+albums+artists; a save reads current then returns the fresh list).
+# Short so an external star still surfaces quickly; the cache exists to
+# collapse the fan-out of the several builders that each need the same payload,
+# not to hold stale data. Mutated/read ONLY on the backend actor thread (see
+# the cover-art cache note above), so no lock is needed.
+STARRED_CACHE_TTL_SECONDS = 5
+
 
 def ref_sort_key(ref):
     return ref.name
+
+
+def _as_list(value):
+    """Coerce a getStarred2 sub-value into a real list.
+
+    py-sonic does no list normalization (``_doInfoReq`` returns the raw parsed
+    JSON), and a server that emits a single starred song/album/artist as a bare
+    object rather than a one-element array would otherwise make the callers
+    iterate a dict's keys (strings) and pass them to ``raw_*_to_ref``, raising
+    AttributeError. This guarantees every element handed onward is a dict.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if isinstance(value, dict):
+        return [value]
+    return []
 
 
 def string_nums_nocase_sort_key(s):
@@ -62,9 +96,7 @@ class SubsonicApi:
         self.port = (
             parsed.port
             if parsed.port
-            else 443
-            if parsed.scheme == "https"
-            else 80
+            else 443 if parsed.scheme == "https" else 80
         )
         base_url = parsed.scheme + "://" + parsed.hostname
         self.connection = libsonic.Connection(
@@ -95,6 +127,11 @@ class SubsonicApi:
         #     track's artUrl stable. LRU-evicted at COVER_ART_CACHE_MAX.
         self._cover_art_id_cache = OrderedDict()
         self._cover_art_url_cache = OrderedDict()
+        # Short-lived (timestamp, payload) slot for the last successful
+        # getStarred2 response. Only ever touched on the backend actor thread.
+        # A failed fetch never populates this, so a stale-but-real payload is
+        # never confused with a network failure.
+        self._starred_cache = None
         logger.info(
             f"Connecting to subsonic server on url {url} as user {username}, "
             f"API version {api_version}"
@@ -404,6 +441,166 @@ class SubsonicApi:
             )
             return None
         return response
+
+    def star(self, song_ids=None, album_ids=None, artist_ids=None):
+        """Star songs/albums/artists. Return True on success, else False.
+
+        Never raises: py-sonic's _checkStatus raises on a failed status, so a
+        network/server failure surfaces as an exception which is logged and
+        reported as False. A caller in the playlist-save path therefore never
+        crashes playback.
+        """
+        try:
+            self.connection.star(
+                sids=song_ids or [],
+                albumIds=album_ids or [],
+                artistIds=artist_ids or [],
+            )
+        except Exception:
+            logger.warning("Connecting to subsonic failed when starring.")
+            return False
+        self._starred_cache = None
+        return True
+
+    def unstar(self, song_ids=None, album_ids=None, artist_ids=None):
+        """Unstar songs/albums/artists. Return True on success, else False.
+
+        Same resilience contract as ``star``; never raises.
+        """
+        try:
+            self.connection.unstar(
+                sids=song_ids or [],
+                albumIds=album_ids or [],
+                artistIds=artist_ids or [],
+            )
+        except Exception:
+            logger.warning("Connecting to subsonic failed when unstarring.")
+            return False
+        self._starred_cache = None
+        return True
+
+    def set_rating(self, item_id, rating):
+        """Set a 0-5 rating on a song/album/artist. Return True on success.
+
+        libsonic raises ArgumentError for an out-of-range/non-int rating, and
+        _checkStatus raises on any failed status; both (and any network
+        failure) are caught and reported as False. Never raises. Wired as API
+        surface for a rating-capable frontend; there is no MPD-client trigger
+        for it in this extension.
+        """
+        try:
+            self.connection.setRating(item_id, rating)
+        except Exception:
+            logger.warning("Connecting to subsonic failed when setting rating.")
+            return False
+        return True
+
+    def get_raw_starred(self):
+        """Return the getStarred2 payload dict, or {} on failure.
+
+        The payload has optional 'song'/'album'/'artist' keys (each a list, or
+        a bare object on some servers - always run through ``_as_list``). A
+        network/server failure returns {}, so browse shows an empty Starred
+        dir and the virtual playlist is empty; playback is never touched.
+
+        IMPORTANT: an empty return ({}) means EITHER "nothing is starred" OR
+        "the fetch failed" - callers that mutate server state on a diff must
+        not treat {} as an authoritative empty set. Use ``fetch_starred`` when
+        that distinction matters.
+
+        Cached for STARRED_CACHE_TTL_SECONDS so the several builders below do
+        not each fire a getStarred2 round-trip within one browse/save.
+        """
+        return self.fetch_starred() or {}
+
+    def fetch_starred(self):
+        """Fetch getStarred2, cached. Return the payload dict, or None on fail.
+
+        Unlike ``get_raw_starred`` this preserves the failure signal (None) so
+        the save path can abort rather than mistake a failed read for an empty
+        starred set.
+        """
+        now = time.monotonic()
+        if (
+            self._starred_cache is not None
+            and now - self._starred_cache[0] < STARRED_CACHE_TTL_SECONDS
+        ):
+            return self._starred_cache[1]
+        try:
+            response = self.connection.getStarred2()
+        except Exception:
+            logger.warning(
+                "Connecting to subsonic failed when loading starred content."
+            )
+            return None
+        # Some servers echo the method-name key ('starred2'); the fallback to
+        # 'starred' is cheap insurance for servers that differ.
+        payload = response.get("starred2") or response.get("starred") or {}
+        self._starred_cache = (now, payload)
+        return payload
+
+    def get_starred_songs_as_refs(self):
+        return [
+            self.raw_song_to_ref(song)
+            for song in _as_list(self.get_raw_starred().get("song"))
+        ]
+
+    def get_starred_albums_as_refs(self):
+        return [
+            self.raw_album_to_ref(album)
+            for album in _as_list(self.get_raw_starred().get("album"))
+        ]
+
+    def get_starred_artists_as_refs(self):
+        return [
+            self.raw_artist_to_ref(artist)
+            for artist in _as_list(self.get_raw_starred().get("artist"))
+        ]
+
+    def get_starred_songs_as_tracks(self):
+        return [
+            self.raw_song_to_track(song)
+            for song in _as_list(self.get_raw_starred().get("song"))
+        ]
+
+    def get_starred_as_refs(self):
+        """Build artist+album+song refs from a SINGLE getStarred2 read.
+
+        Reads the raw starred payload once (None on failure is treated as
+        empty for this read-only display path) and derives all three ref
+        lists from that one dict, so a browse of the Starred dir issues
+        exactly one getStarred2 round-trip.
+        """
+        starred = self.fetch_starred() or {}
+        return (
+            [
+                self.raw_artist_to_ref(artist)
+                for artist in _as_list(starred.get("artist"))
+            ]
+            + [
+                self.raw_album_to_ref(album)
+                for album in _as_list(starred.get("album"))
+            ]
+            + [
+                self.raw_song_to_ref(song)
+                for song in _as_list(starred.get("song"))
+            ]
+        )
+
+    def get_starred_song_ids(self):
+        """Return the set of currently-starred song ids as strings.
+
+        Ids are stringified so a set diff against uri-extracted ids (also
+        strings) compares like-for-like even if the server returns ints.
+        Returns an empty set on failure (see get_raw_starred caveat).
+        """
+        return {
+            str(song.get("id"))
+            for song in _as_list(self.get_raw_starred().get("song"))
+        }
+
+    def invalidate_starred_cache(self):
+        self._starred_cache = None
 
     def get_album_by_id(self, album_id):
         try:
@@ -730,21 +927,31 @@ class SubsonicApi:
             track_no=int(song.get("track")) if song.get("track") else None,
             date=str(song.get("year")) or "none",
             genre=song.get("genre"),
-            length=int(song.get("duration")) * 1000
-            if song.get("duration")
-            else None,
-            disc_no=int(song.get("discNumber"))
-            if song.get("discNumber")
-            else None,
+            length=(
+                int(song.get("duration")) * 1000
+                if song.get("duration")
+                else None
+            ),
+            disc_no=(
+                int(song.get("discNumber")) if song.get("discNumber") else None
+            ),
             artists=[
                 Artist(
                     name=song.get("artist"),
-                    uri=uri.get_artist_uri(song.get("artistId")),
+                    uri=(
+                        uri.get_artist_uri(song.get("artistId"))
+                        if song.get("artistId")
+                        else None
+                    ),
                 )
             ],
             album=Album(
                 name=song.get("album"),
-                uri=uri.get_album_uri(song.get("albumId")),
+                uri=(
+                    uri.get_album_uri(song.get("albumId"))
+                    if song.get("albumId")
+                    else None
+                ),
             ),
         )
 
@@ -771,7 +978,11 @@ class SubsonicApi:
             artists=[
                 Artist(
                     name=album.get("artist"),
-                    uri=uri.get_artist_uri(album.get("artistId")),
+                    uri=(
+                        uri.get_artist_uri(album.get("artistId"))
+                        if album.get("artistId")
+                        else None
+                    ),
                 )
             ],
         )

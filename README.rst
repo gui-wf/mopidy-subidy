@@ -63,6 +63,44 @@ In addition, the following optional configuration values are supported:
   whichever comes first (the standard AudioScrobbler rule).
 
 
+Starred / loved content
+=======================
+
+Mopidy-Subidy surfaces your Subsonic starred (loved) content in two ways, and
+lets MPD clients such as ncmpcpp star tracks even though MPD has no native
+"star" command:
+
+- A top-level **Starred** browse directory (under the Subsonic root) that lists
+  your starred artists, albums and tracks, populated via ``getStarred2``. This
+  is a read-only mirror.
+
+- A virtual editable **Starred** playlist. Adding a track to this playlist and
+  saving it stars the track on the server; removing a track and saving unstars
+  it. Saving diffs the playlist against the server's current starred set, so
+  re-saving an unchanged playlist makes no server changes.
+
+Important behaviour and limits:
+
+- **Songs only.** The Starred *playlist* trigger stars/unstars songs only.
+  Starred albums and artists are visible in the Starred *browse directory* but
+  cannot be starred or unstarred through the playlist (Mopidy models a playlist
+  as a list of tracks). Star albums/artists from another Subsonic client.
+
+- **Clearing the Starred playlist does not mass-unstar.** Saving an empty
+  Starred playlist (e.g. ``playlistclear Starred``) is treated as a no-op for
+  unstarring rather than removing every star, since that would be
+  unrecoverable. Remove individual tracks and save to unstar them.
+
+- **Resilient.** If the server is unreachable, the Starred dir/playlist appear
+  empty and saving changes nothing; playback is never interrupted. In
+  particular, a failed read of the current starred set aborts a save instead of
+  risking a destructive diff.
+
+No configuration is required; the feature relies only on the standard
+``star``/``unstar``/``getStarred2`` endpoints (Subsonic API 1.8.0+), well below
+the default ``api_version``.
+
+
 State of this plugin
 ====================
 
@@ -72,11 +110,13 @@ The following things are supported:
 - Searching for any terms
 - Browsing, creating, editing and deleting playlists
 - Searching explicitly for one of: artists, albums, tracks
+- Browsing starred content and starring/unstarring tracks (see above)
 
 The following things are **not** supported:
 
 - Subsonic's smart playlists
 - Searching for a combination of filters (artist and album, artist and track, etc.)
+- Starring albums/artists via the MPD playlist trigger (browse-only)
 
 
 Credits
