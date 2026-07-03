@@ -1,5 +1,8 @@
 import logging
+import os
 import re
+from collections import OrderedDict
+from hashlib import md5
 from urllib.parse import urlencode, urlparse
 
 import libsonic
@@ -14,6 +17,17 @@ UNKNOWN_ALBUM = "Unknown Album"
 UNKNOWN_ARTIST = "Unknown Artist"
 MAX_SEARCH_RESULTS = 100
 MAX_LIST_RESULTS = 500
+
+# Stable cover-art size (px) requested from getCoverArt. Kept as a plain
+# constant rather than a config key to keep the extension's footprint small;
+# the value is baked into the image URL so a given track always yields the
+# same URL (which lets GNOME/MPRIS cache art by URL).
+DEFAULT_IMAGE_SIZE = 600
+
+# Upper bound on the two cover-art caches so a long-lived service does not
+# grow them without limit. Both are LRU-evicted (oldest first) at the cap, so
+# a URL that was handed out stays stable as long as it is still in use.
+COVER_ART_CACHE_MAX = 4096
 
 
 def ref_sort_key(ref):
@@ -66,6 +80,21 @@ class SubsonicApi:
         self.url = url + "/rest"
         self.username = username
         self.password = password
+        # Cover-art caches. Both are mutated and read ONLY on the backend
+        # actor thread (SubidyBackend is a pykka.ThreadingActor, and
+        # core.library.get_images is routed through that actor), so a plain
+        # dict is safe here without locking.
+        #   _cover_art_id_cache: mopidy uri -> Subsonic coverArt id (or None).
+        #     Pre-populated at parse time (raw_song_to_track / raw_album_to_album)
+        #     so the common case (a browsed or playing item) resolves with zero
+        #     network calls. Negatives are cached so artless URIs are not
+        #     re-resolved. LRU-evicted at COVER_ART_CACHE_MAX.
+        #   _cover_art_url_cache: (id, size) -> fully built getCoverArt URL.
+        #     Required because a fresh salt is drawn on every build, so building
+        #     the URL twice yields two different strings; caching keeps a
+        #     track's artUrl stable. LRU-evicted at COVER_ART_CACHE_MAX.
+        self._cover_art_id_cache = OrderedDict()
+        self._cover_art_url_cache = OrderedDict()
         logger.info(
             f"Connecting to subsonic server on url {url} as user {username}, "
             f"API version {api_version}"
@@ -92,6 +121,97 @@ class SubsonicApi:
 
     def get_censored_song_stream_uri(self, song_id):
         return self.get_subsonic_uri("stream", dict(id=song_id), True)
+
+    def _cover_art_auth_qdict(self):
+        """Build the auth query params for a cover-art URL.
+
+        Always uses salt+token, never the plaintext password and never the
+        legacy ``p=enc:<hex>`` form (which is a reversible hex of the real
+        password). This deliberately does NOT reuse the plaintext stream path
+        (get_subsonic_uri) nor py-sonic's _getBaseQdict, so the resulting
+        image URL is safe to hand to GNOME/MPRIS even under legacy_auth.
+        """
+        salt = md5(os.urandom(100)).hexdigest()[:12]
+        token = md5((self.password + salt).encode("utf-8")).hexdigest()
+        return {
+            "u": self.username,
+            "s": salt,
+            "t": token,
+            "v": self.connection.apiVersion,
+            "c": self.connection.appName,
+        }
+
+    def get_cover_art_url(self, cover_art_id, size=None):
+        """Return a directly-fetchable getCoverArt URL, or None.
+
+        The built URL is cached per (cover_art_id, size) for the process
+        lifetime so a given item always yields the same URL (salt is fixed at
+        first build). The URL is never logged: it carries a salted token.
+        """
+        if not cover_art_id:
+            return None
+        if size is None:
+            size = DEFAULT_IMAGE_SIZE
+        cover_art_id = str(cover_art_id)
+        cache_key = (cover_art_id, size)
+        cached = self._cover_art_url_cache.get(cache_key)
+        if cached is not None:
+            self._cover_art_url_cache.move_to_end(cache_key)
+            return cached
+        qdict = self._cover_art_auth_qdict()
+        qdict.update(id=cover_art_id, size=size)
+        url = "{}/getCoverArt.view?{}".format(self.url, urlencode(qdict))
+        self._cover_art_url_cache[cache_key] = url
+        while len(self._cover_art_url_cache) > COVER_ART_CACHE_MAX:
+            self._cover_art_url_cache.popitem(last=False)
+        return url
+
+    def _remember_cover_art_id(self, mopidy_uri, cover_art_id):
+        """Record a uri -> coverArt id mapping (LRU, negatives allowed)."""
+        if cover_art_id is not None:
+            cover_art_id = str(cover_art_id)
+        self._cover_art_id_cache[mopidy_uri] = cover_art_id
+        self._cover_art_id_cache.move_to_end(mopidy_uri)
+        while len(self._cover_art_id_cache) > COVER_ART_CACHE_MAX:
+            self._cover_art_id_cache.popitem(last=False)
+        return cover_art_id
+
+    def get_cover_art_id_for_uri(self, mopidy_uri):
+        """Resolve a subidy URI to a Subsonic coverArt id, cache-first.
+
+        The cache is pre-populated at parse time for every song/album that was
+        browsed or is playing, so the normal path returns here with zero
+        network calls. The cold fallback below (a getSong/getAlbum/getArtist
+        call) is hit only for a uri that was never parsed - essentially a cold
+        MPRIS query for a single uri, which may block briefly. Negatives are
+        cached too, so artless URIs are not re-fetched on every metadata poll.
+        Never raises.
+        """
+        if mopidy_uri in self._cover_art_id_cache:
+            self._cover_art_id_cache.move_to_end(mopidy_uri)
+            return self._cover_art_id_cache[mopidy_uri]
+        uri_type = uri.get_type(mopidy_uri)
+        cover_art_id = None
+        try:
+            if uri_type == uri.SONG:
+                song_id = uri.get_song_id(mopidy_uri)
+                song = self.connection.getSong(song_id).get("song") or {}
+                cover_art_id = song.get("coverArt") or song_id
+            elif uri_type == uri.ALBUM:
+                album_id = uri.get_album_id(mopidy_uri)
+                album = self.connection.getAlbum(album_id).get("album") or {}
+                cover_art_id = album.get("coverArt") or album_id
+            elif uri_type == uri.ARTIST:
+                artist_id = uri.get_artist_id(mopidy_uri)
+                artist = (
+                    self.connection.getArtist(artist_id).get("artist") or {}
+                )
+                cover_art_id = artist.get("coverArt")
+        except Exception:
+            logger.warning(
+                "Connecting to subsonic failed when resolving cover art."
+            )
+        return self._remember_cover_art_id(mopidy_uri, cover_art_id)
 
     def find_raw(
         self,
@@ -596,9 +716,16 @@ class SubsonicApi:
     def raw_song_to_track(self, song):
         if song is None:
             return None
+        song_uri = uri.get_song_uri(song.get("id"))
+        # Pre-populate the cover-art cache so get_images resolves this track
+        # with no extra network call. Fall back to the song id (a valid
+        # getCoverArt id on every Subsonic server) when no coverArt is given.
+        self._remember_cover_art_id(
+            song_uri, song.get("coverArt") or song.get("id")
+        )
         return Track(
             name=song.get("title") or UNKNOWN_SONG,
-            uri=uri.get_song_uri(song.get("id")),
+            uri=song_uri,
             bitrate=song.get("bitRate"),
             track_no=int(song.get("track")) if song.get("track") else None,
             date=str(song.get("year")) or "none",
@@ -632,10 +759,15 @@ class SubsonicApi:
     def raw_album_to_album(self, album):
         if album is None:
             return None
+        album_uri = uri.get_album_uri(album.get("id"))
+        # Pre-populate the cover-art cache (see raw_song_to_track).
+        self._remember_cover_art_id(
+            album_uri, album.get("coverArt") or album.get("id")
+        )
         return Album(
             name=album.get("title") or album.get("name") or UNKNOWN_ALBUM,
             num_tracks=album.get("songCount"),
-            uri=uri.get_album_uri(album.get("id")),
+            uri=album_uri,
             artists=[
                 Artist(
                     name=album.get("artist"),

@@ -1,8 +1,8 @@
 import logging
 
 from mopidy import backend
-from mopidy.models import Ref, SearchResult
-from mopidy_subidy import uri
+from mopidy.models import Image, Ref, SearchResult
+from mopidy_subidy import subsonic_api, uri
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +133,37 @@ class SubidyLibraryProvider(backend.LibraryProvider):
         if uri is not None:
             return self.lookup_one(uri)
         return None
+
+    def get_images(self, uris):
+        """Return cover-art images for song/album/artist URIs.
+
+        Maps each input URI to a list of mopidy Images (empty for URIs with
+        no art or of an unsupported type). The result is keyed by the exact
+        input URI, as mopidy core rejects any other key. Runs on the backend
+        actor thread and must never raise, so each URI is guarded: a failure
+        yields [] for that URI and leaves playback unaffected.
+        """
+        result = {}
+        for u in uris:
+            try:
+                result[u] = self._images_for_uri(u)
+            except Exception:
+                logger.warning("Failed to resolve cover art for %s", u)
+                result[u] = []
+        return result
+
+    def _images_for_uri(self, u):
+        uri_type = uri.get_type(u)
+        if uri_type not in (uri.SONG, uri.ALBUM, uri.ARTIST):
+            return []
+        cover_art_id = self.subsonic_api.get_cover_art_id_for_uri(u)
+        if not cover_art_id:
+            return []
+        url = self.subsonic_api.get_cover_art_url(cover_art_id)
+        if not url:
+            return []
+        size = subsonic_api.DEFAULT_IMAGE_SIZE
+        return [Image(uri=url, width=size, height=size)]
 
     def refresh(self, uri):
         pass
