@@ -23,9 +23,12 @@ class SubidyExtension(ext.Extension):
         schema["password"] = config.Secret()
         schema["legacy_auth"] = config.Boolean(optional=True)
         schema["api_version"] = config.String(optional=True)
+        schema["scrobbling"] = config.Boolean(optional=True)
         return schema
 
     def setup(self, registry):
         from .backend import SubidyBackend
+        from .frontend import SubidyScrobblerFrontend
 
         registry.add("backend", SubidyBackend)
+        registry.add("frontend", SubidyScrobblerFrontend)

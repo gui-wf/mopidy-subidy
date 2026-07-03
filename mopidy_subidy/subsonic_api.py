@@ -271,6 +271,20 @@ class SubsonicApi:
             else None
         )
 
+    def scrobble(self, song_id, submission=True):
+        try:
+            response = self.connection.scrobble(song_id, submission=submission)
+        except Exception:
+            logger.warning("Connecting to subsonic failed when scrobbling.")
+            return None
+        if response.get("status") != RESPONSE_OK:
+            logger.warning(
+                "Got non-okay status code from subsonic: %s"
+                % response.get("status")
+            )
+            return None
+        return response
+
     def get_album_by_id(self, album_id):
         try:
             response = self.connection.getAlbum(album_id)

@@ -56,6 +56,12 @@ In addition, the following optional configuration values are supported:
 - ``api_version`` -- Defaults to ``1.14.0``, which is the version used by
   Subsonic 6.2.
 
+- ``scrobbling`` -- Defaults to ``true``. Set to ``false`` to disable
+  submitting plays to the Subsonic server. When enabled, Mopidy-Subidy sends a
+  "now playing" notification when a track starts and submits a completed play
+  once the track has been played for at least half its length or four minutes,
+  whichever comes first (the standard AudioScrobbler rule).
+
 
 State of this plugin
 ====================
