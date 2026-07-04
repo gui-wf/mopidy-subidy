@@ -56,6 +56,31 @@ DEFAULT_IMAGE_SIZE = 600
 # a URL that was handed out stays stable as long as it is still in use.
 COVER_ART_CACHE_MAX = 4096
 
+# Short-TTL bounded LRU cache for the expensive, rarely-changing browse
+# listings (getArtists, getIndexes rootdirs, getMusicDirectory dir listings,
+# getAlbumList2 smart-list pages, getGenres). The TTL is short enough that a
+# server-side library change surfaces quickly, long enough to collapse the
+# repeated getArtists/getIndexes/getMusicDirectory/getAlbumList2/getGenres
+# calls a single browse fan-out issues. Configurable via `listing_cache_ttl`
+# (0 disables the cache entirely); this is the fallback when the key is absent.
+#
+# NOTE ON VOLATILITY: getArtists/getIndexes/getGenres are effectively static.
+# The getAlbumList2 smart-lists frequent/recent/newest/highest are NOT static -
+# this extension ships a scrobbler (frontend.py) and a setRating surface, so
+# those lists mutate as the user plays/rates. They are cached anyway, but ONLY
+# as a browse-fan-out collapse over this short TTL: a just-scrobbled play may
+# lag its Most-Played/Recently-Played position by up to the TTL, which is an
+# accepted, documented tradeoff for a browse listing (not a claim of
+# staticness). The `random` list is never cached (stays fresh per browse).
+LISTING_CACHE_TTL_DEFAULT = 30
+
+# Upper bound on the listing cache so a long-lived service does not grow it
+# without limit. A plain constant (not a config key) to keep the extension's
+# footprint small, matching COVER_ART_CACHE_MAX's rationale. Directory
+# listings dominate the entry count (a deep recursive lookup_directory walk can
+# touch many subdirs); 512 cold dirs are bounded and LRU-evicted oldest-first.
+LISTING_CACHE_MAX = 512
+
 # Reserved playlist/vdir id for the "starred" surfaces. Defined once here and
 # imported by library.py and playlists.py so the magic string cannot drift.
 # Subsonic server playlist ids are numeric/uuid and never this literal, so an
@@ -175,6 +200,53 @@ def diritem_sort_key(item):
     return (isdir, key)
 
 
+class _TtlLru:
+    """A tiny bounded LRU cache with a per-entry TTL.
+
+    Reuses the OrderedDict LRU pattern already used by the cover-art caches.
+    ``get`` returns a ``(hit, value)`` tuple so a legitimately-cached empty
+    value (e.g. an empty-but-real library) is distinguishable from a miss.
+    Never returns a stale entry: an expired key is dropped on access and
+    reported as a miss.
+
+    NOT thread-safe by design: like the cover-art and starred caches, it is
+    only ever touched on the backend actor thread (see the __init__ note), so
+    no lock is needed.
+
+    A ttl of <= 0 turns every ``get`` into a miss and every ``set`` into a
+    no-op, so ``listing_cache_ttl = 0`` is a genuine off switch.
+    """
+
+    def __init__(self, maxsize, ttl):
+        self._d = OrderedDict()
+        self._max = maxsize
+        self._ttl = ttl
+
+    def get(self, key):
+        if self._ttl <= 0:
+            return (False, None)
+        entry = self._d.get(key)
+        if entry is None:
+            return (False, None)
+        ts, value = entry
+        if time.monotonic() - ts >= self._ttl:
+            del self._d[key]
+            return (False, None)
+        self._d.move_to_end(key)
+        return (True, value)
+
+    def set(self, key, value):
+        if self._ttl <= 0:
+            return
+        self._d[key] = (time.monotonic(), value)
+        self._d.move_to_end(key)
+        while len(self._d) > self._max:
+            self._d.popitem(last=False)
+
+    def clear(self):
+        self._d.clear()
+
+
 class SubsonicApi:
     def __init__(
         self,
@@ -187,6 +259,7 @@ class SubsonicApi:
         radio_size=None,
         album_list_size=None,
         genre_songs_size=None,
+        listing_cache_ttl=None,
     ):
         # radio_size / album_list_size / genre_songs_size may be None (config
         # key absent/empty); coerce to the module default. A present value is
@@ -195,6 +268,14 @@ class SubsonicApi:
         self.radio_size = radio_size or RADIO_SIZE_DEFAULT
         self.album_list_size = album_list_size or ALBUM_LIST_SIZE_DEFAULT
         self.genre_songs_size = genre_songs_size or GENRE_SONGS_SIZE_DEFAULT
+        # listing_cache_ttl may be None (config key absent) -> module default;
+        # an explicit 0 is honored (disables the listing cache) and must NOT be
+        # coerced to the default, so `is None` rather than a truthiness check.
+        self.listing_cache_ttl = (
+            LISTING_CACHE_TTL_DEFAULT
+            if listing_cache_ttl is None
+            else listing_cache_ttl
+        )
         parsed = urlparse(url)
         self.port = (
             parsed.port
@@ -235,6 +316,19 @@ class SubsonicApi:
         # A failed fetch never populates this, so a stale-but-real payload is
         # never confused with a network failure.
         self._starred_cache = None
+        # Short-TTL bounded LRU cache for the expensive, rarely-changing browse
+        # listings (getArtists, rootdirs, dir listings, smart-list album pages,
+        # genres). Like the caches above, it is touched ONLY on the backend
+        # actor thread: SubidyBackend is a pykka.ThreadingActor and browse /
+        # get_images / playlists all route through that actor. The frontend
+        # (frontend.py) builds a SEPARATE SubsonicApi instance that only
+        # scrobbles and never calls the wrapped fetchers, so this cache never
+        # crosses actors - hence no lock. It never holds starred/random/search
+        # data, so star/unstar/set_rating do not need to bust it (they carry no
+        # state into the cached artist/dir/album/genre refs).
+        self._listing_cache = _TtlLru(
+            LISTING_CACHE_MAX, self.listing_cache_ttl
+        )
         logger.info(
             f"Connecting to subsonic server on url {url} as user {username}, "
             f"API version {api_version}"
@@ -483,20 +577,49 @@ class SubsonicApi:
             return None
         return response
 
+    def _cached(self, key, producer):
+        """Cache-through the result of ``producer`` under ``key``.
+
+        Collapses the repeated per-browse fan-out of the expensive listing
+        fetchers (getArtists / getIndexes / getMusicDirectory / getAlbumList2 /
+        getGenres). On a hit the cached value is returned with zero network
+        calls; on a miss the producer runs and its result is stored.
+
+        RESILIENCE: every NON-FAILURE result is cached, INCLUDING an empty but
+        genuine listing ([] artists / [] dir children). The wrapped fetchers use
+        None as the single, distinguishable failure sentinel (network error or
+        non-okay status): empty-success is [] and failure is None. Only the None
+        sentinel is left uncached, so a transient blip self-heals on the very
+        next browse instead of freezing a directory/list empty for a full TTL,
+        while a genuinely static empty listing is cached and not re-fetched every
+        browse. The (hit, value) tuple from the LRU keeps a cached [] a HIT, not
+        a miss.
+        """
+        hit, value = self._listing_cache.get(key)
+        if hit:
+            return value
+        value = producer()
+        if value is not None:
+            self._listing_cache.set(key, value)
+        return value
+
     def get_raw_artists(self):
+        return self._cached(("artists",), self._fetch_raw_artists)
+
+    def _fetch_raw_artists(self):
         try:
             response = self.connection.getArtists()
         except Exception:
             logger.warning(
                 "Connecting to subsonic failed when loading list of artists."
             )
-            return []
+            return None
         if response.get("status") != RESPONSE_OK:
             logger.warning(
                 "Got non-okay status code from subsonic: %s"
                 % response.get("status")
             )
-            return []
+            return None
         letters = response.get("artists").get("index")
         if letters is not None:
             artists = [
@@ -508,22 +631,27 @@ class SubsonicApi:
         logger.warning(
             "Subsonic does not seem to have any artists in it's library."
         )
+        # Empty-but-successful library: [] is cacheable, unlike the None
+        # failure sentinels above.
         return []
 
     def get_raw_rootdirs(self):
+        return self._cached(("rootdirs",), self._fetch_raw_rootdirs)
+
+    def _fetch_raw_rootdirs(self):
         try:
             response = self.connection.getIndexes()
         except Exception:
             logger.warning(
                 "Connecting to subsonic failed when loading list of rootdirs."
             )
-            return []
+            return None
         if response.get("status") != RESPONSE_OK:
             logger.warning(
                 "Got non-okay status code from subsonic: %s"
                 % response.get("status")
             )
-            return []
+            return None
         letters = response.get("indexes").get("index")
         if letters is not None:
             artists = [
@@ -810,6 +938,25 @@ class SubsonicApi:
         return response.get("playlist")
 
     def get_raw_dir(self, parent_id):
+        """Return the name/track-sorted diritems for a music directory, or None.
+
+        Cache-through keyed by ("dir", str(parent_id)) - str() coercion guards
+        an int-vs-str server id from producing two keys for one directory. An
+        empty-but-real dir ([]) IS cached; only the None failure sentinel is
+        left uncached (see _cached), so a transient blip re-fetches next browse
+        and never freezes a dir empty for the whole TTL.
+
+        This cache is SHARED with the recursive lookup_directory walk
+        (get_recursive_dir_as_songs_as_tracks_iter): a deep add-to-queue can
+        touch many subdirs and churn the 512-entry LRU cap. Acceptable - the
+        walk's own reads are collapsed too, and 512 bounds the footprint.
+        """
+        return self._cached(
+            ("dir", str(parent_id)),
+            lambda: self._fetch_raw_dir(parent_id),
+        )
+
+    def _fetch_raw_dir(self, parent_id):
         try:
             response = self.connection.getMusicDirectory(parent_id)
         except Exception:
@@ -825,8 +972,16 @@ class SubsonicApi:
             return None
         directory = response.get("directory")
         if directory is not None:
-            diritems = directory.get("child")
+            # An empty directory is a SUCCESS with no children: getMusicDirectory
+            # omits (or nulls) 'child'. Coerce to [] so sorted() never sees None
+            # (a TypeError) and callers get a clean empty listing. None is
+            # reserved strictly for the network/API failure paths above, so the
+            # cache can safely store an empty-but-real dir while never caching a
+            # blip (see _cached).
+            diritems = directory.get("child") or []
             return sorted(diritems, key=diritem_sort_key)
+        # No 'directory' object at all - treat as a failure sentinel, not an
+        # empty success.
         return None
 
     def get_raw_artist(self, artist_id):
@@ -1006,20 +1161,26 @@ class SubsonicApi:
         returns None WITHOUT raising, so the status guard below is a real guard,
         not dead code. The result is run through _as_list because some servers
         emit a single genre as a bare object, not a one-element array.
+
+        Cache-through keyed by ("genres",); an empty-but-real [] is cached, the
+        None failure sentinel is not (see _cached).
         """
+        return self._cached(("genres",), self._fetch_raw_genres)
+
+    def _fetch_raw_genres(self):
         try:
             response = self.connection.getGenres()
         except Exception:
             logger.warning(
                 "Connecting to subsonic failed when loading genres."
             )
-            return []
+            return None
         if response.get("status") != RESPONSE_OK:
             logger.warning(
                 "Got non-okay status code from subsonic: %s"
                 % response.get("status")
             )
-            return []
+            return None
         # genres may be absent OR present-but-None on a status-ok empty
         # response; guard the chained .get so it never raises AttributeError.
         genres = response.get("genres") or {}
@@ -1027,7 +1188,7 @@ class SubsonicApi:
 
     def get_genres_as_refs(self):
         refs = []
-        for genre in self.get_raw_genres():
+        for genre in self.get_raw_genres() or []:
             # The genre name lives in the 'value' key per the Subsonic spec;
             # fall back to 'name' for server/serializer variants that key it
             # differently. Skip non-string or whitespace-only values (a
@@ -1149,8 +1310,29 @@ class SubsonicApi:
         the first page. Resilient: get_more_albums logs and returns [] on any
         network/server failure, so this never raises - a failed or empty list
         renders as an empty dir.
+
+        CACHING: the raw smart-list page is cached here (NOT in the shared
+        get_more_albums, which is also driven by the size=500 full-library
+        pagination loop for the Albums vdir / search - caching there would
+        double-key by size and hold large unscoped pages). The `random` list is
+        never cached so it stays fresh per browse; the volatile play/rating-
+        driven lists (frequent/recent/newest/highest) ARE cached, but only as a
+        short-TTL browse-fan-out collapse (see LISTING_CACHE_TTL_DEFAULT) - a
+        just-scrobbled play may lag by up to the TTL, an accepted tradeoff. Note
+        get_more_albums returns [] on both an empty page and a failure (it feeds
+        the size=500 pagination loop, which needs a real list, not None), so a
+        cached [] here may be either - acceptable for these volatile lists since
+        they re-evaluate every TTL anyway.
         """
-        albums = self.get_more_albums(ltype, self.album_list_size, offset)
+        if ltype == "random":
+            albums = self.get_more_albums(ltype, self.album_list_size, offset)
+        else:
+            albums = self._cached(
+                ("albumlist2", ltype, self.album_list_size, offset),
+                lambda: self.get_more_albums(
+                    ltype, self.album_list_size, offset
+                ),
+            )
         return [self.raw_album_to_ref(album) for album in albums]
 
     def get_albums_as_refs_from_raw(self, raw_artist):
@@ -1197,13 +1379,14 @@ class SubsonicApi:
 
     def get_artists_as_refs(self):
         return [
-            self.raw_artist_to_ref(artist) for artist in self.get_raw_artists()
+            self.raw_artist_to_ref(artist)
+            for artist in self.get_raw_artists() or []
         ]
 
     def get_rootdirs_as_refs(self):
         return [
             self.raw_directory_to_ref(rootdir)
-            for rootdir in self.get_raw_rootdirs()
+            for rootdir in self.get_raw_rootdirs() or []
         ]
 
     def get_diritems_as_refs(self, directory_id):
@@ -1215,7 +1398,13 @@ class SubsonicApi:
                     if diritem.get("isDir")
                     else self.raw_song_to_ref(diritem)
                 )
-                for diritem in self.get_raw_dir(directory_id)
+                # get_raw_dir returns None on a failed/empty-container fetch;
+                # iterating None would raise TypeError (a pre-existing latent
+                # bug this caching change sits directly on top of). `or []`
+                # degrades a failed dir browse to an empty listing rather than a
+                # crash, keeping the "never crash playback" contract - and the
+                # cache never stores that None, so the next browse retries.
+                for diritem in self.get_raw_dir(directory_id) or []
             )
             if ref is not None
         ]
@@ -1249,7 +1438,7 @@ class SubsonicApi:
     def get_artists_as_artists(self):
         return [
             self.raw_artist_to_artist(artist)
-            for artist in self.get_raw_artists()
+            for artist in self.get_raw_artists() or []
         ]
 
     def get_playlists_as_refs(self):

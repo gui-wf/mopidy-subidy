@@ -48,6 +48,15 @@ class SubidyExtension(ext.Extension):
         schema["genre_songs_size"] = config.Integer(
             optional=True, minimum=1, maximum=500
         )
+        # Seconds a browse listing (getArtists / rootdirs / dir listings /
+        # smart-list album pages / genres) is cached to collapse the repeated
+        # round-trips a single browse fan-out issues. 0 disables the listing
+        # cache entirely (every browse re-fetches). Integer(optional=True, ...)
+        # REJECTS a negative at load; ext.conf ships a default of 30. This
+        # cache never holds starred/random/search data, so the knob only
+        # affects static-listing staleness (and the short lag of the
+        # play/rating-driven smart-lists).
+        schema["listing_cache_ttl"] = config.Integer(optional=True, minimum=0)
         return schema
 
     def setup(self, registry):

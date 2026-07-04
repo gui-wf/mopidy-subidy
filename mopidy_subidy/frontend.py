@@ -33,6 +33,11 @@ class SubidyScrobblerFrontend(pykka.ThreadingActor, core.CoreListener):
             app_name=mopidy_subidy.SubidyExtension.dist_name,
             legacy_auth=subidy_config["legacy_auth"],
             api_version=subidy_config["api_version"],
+            # The scrobbler frontend only submits nowPlaying/scrobble and never
+            # browses, so its SubsonicApi never touches the listing cache.
+            # Passing 0 makes _TtlLru a no-op (get always misses, set is a
+            # no-op) so no browse-cache memory is held for this instance.
+            listing_cache_ttl=0,
         )
 
     def on_start(self):
