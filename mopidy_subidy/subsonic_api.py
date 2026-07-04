@@ -338,6 +338,111 @@ class SubsonicApi:
         except Exception as e:
             logger.error("Unable to reach subsonic server: %s" % e)
             exit()
+        # Capability detection. Initialized to {} BEFORE negotiation so
+        # supports_extension can never hit AttributeError even if negotiation
+        # is somehow skipped. Runs strictly AFTER the ping try/except above, so
+        # a failed ping short-circuits via exit() before we ever get here.
+        # name -> set(int versions); {} means none/unknown.
+        self._opensubsonic_extensions = {}
+        self._negotiate_opensubsonic_extensions()
+
+    def _negotiate_opensubsonic_extensions(self):
+        """Fetch getOpenSubsonicExtensions once and cache name -> versions.
+
+        Never raises: any failure leaves the store empty (treated as "no
+        extensions"). Two distinct degrade paths, both non-fatal:
+          - Network error or non-JSON (classic Subsonic answering an unknown
+            method with an HTTP error or an HTML body): py-sonic's
+            ``_doInfoReq`` raises and we catch it in the except branch.
+          - JSON error envelope (HTTP 200, ``status='failed'``): ``_doInfoReq``
+            does NOT check status, so it returns the parsed dict normally; the
+            ``openSubsonicExtensions`` key is then absent, ``_as_list(None)``
+            yields [], and the store stays empty.
+        getOpenSubsonicExtensions is spec-mandated public (no auth), so the
+        auth params py-sonic injects are sent but ignored by the server; we
+        call through the private request path purely to avoid re-implementing
+        the URL/serverPath assembly, not for its auth handling.
+        """
+        try:
+            req = self.connection._getRequest(
+                "getOpenSubsonicExtensions.view"
+            )
+            response = self.connection._doInfoReq(req)
+        except Exception as e:
+            logger.info(
+                "Server does not advertise OpenSubsonic extensions "
+                "(getOpenSubsonicExtensions unavailable: %s)",
+                e,
+            )
+            return
+        # ``_doInfoReq`` returns ``dres['subsonic-response']`` verbatim without
+        # a type check, so a malformed body (e.g. ``{"subsonic-response":
+        # null}`` or a non-object envelope) yields a non-dict here. Guard before
+        # ``.get`` so a bad payload degrades to "no extensions" rather than
+        # raising out of __init__ and taking down backend startup.
+        if not isinstance(response, dict):
+            logger.info(
+                "getOpenSubsonicExtensions returned an unexpected payload "
+                "(%s); treating as no extensions",
+                type(response).__name__,
+            )
+            return
+        # Belt-and-suspenders: the negotiation runs from __init__, so the parse
+        # below must NEVER raise (a malformed payload must not take down backend
+        # startup). Guard the whole loop, not just the request above.
+        try:
+            store = {}
+            for ext in _as_list(response.get("openSubsonicExtensions")):
+                name = ext.get("name")
+                if not name:
+                    continue
+                # ``versions`` may be a list of ints, a bare int (some servers),
+                # or absent. Explicit None check (not ``or []``) so a legitimate
+                # falsy ``versions: 0`` is not dropped. bool is an int subclass,
+                # so exclude it - ``versions: [true]`` must not read as {1}.
+                versions = ext.get("versions")
+                if versions is None:
+                    versions = []
+                if not isinstance(versions, list):
+                    versions = [versions]
+                store[name] = {
+                    v
+                    for v in versions
+                    if isinstance(v, int) and not isinstance(v, bool)
+                }
+        except Exception as e:
+            logger.info(
+                "Could not parse OpenSubsonic extensions (%s); "
+                "treating as no extensions",
+                e,
+            )
+            return
+        self._opensubsonic_extensions = store
+        if store:
+            logger.info(
+                "Server supports OpenSubsonic extensions: %s",
+                ", ".join(
+                    f"{n}={sorted(v)}" for n, v in sorted(store.items())
+                ),
+            )
+        else:
+            logger.info("Server advertises no OpenSubsonic extensions")
+
+    def supports_extension(self, name, version=None):
+        """True if the server advertised OpenSubsonic extension ``name``.
+
+        If ``version`` is given, requires that exact version int to be
+        advertised (OpenSubsonic advertises a discrete versions array, so this
+        is exact membership, not ">="; a caller wanting "at least vN" must
+        check ``max(versions)`` itself). Never raises; a failed or absent
+        negotiation always yields False.
+        """
+        versions = self._opensubsonic_extensions.get(name)
+        if versions is None:
+            return False
+        if version is None:
+            return True
+        return version in versions
 
     def get_subsonic_uri(self, view_name, params, censor=False):
         di_params = {}
