@@ -68,6 +68,10 @@ In addition, the following optional configuration values are supported:
   per-album ``Similar Songs``. Also governs the random-songs browse and the
   ``comment=random`` search.
 
+- ``album_list_size`` -- Defaults to ``100`` (allowed range 1-500). Number of
+  albums returned by each smart-list surface under the ``Lists`` directory (see
+  below). One capped ``getAlbumList2`` page per browse.
+
 
 Radio and instant-mix
 ====================
@@ -98,6 +102,30 @@ Navidrome frequently return nothing for artists that lack MusicBrainz IDs, so
 an empty **Similar Songs** / **Top Songs** directory is expected behaviour, not
 a fault. A network or server failure likewise yields an empty dir and never
 interrupts playback.
+
+
+Album smart-lists
+================
+
+A top-level **Lists** directory surfaces the server's album smart-lists as
+browsable sub-directories, each backed by ``getAlbumList2`` with the matching
+type. Browse into one to get its albums; selecting an album opens its tracks via
+the normal album path.
+
+- **Most Played** - ``frequent``
+- **Recently Added** - ``newest``
+- **Recently Played** - ``recent``
+- **Highest Rated** - ``highest``
+- **Random** - ``random`` (re-drawn on every browse, never cached)
+
+Each list returns a single ``album_list_size``-capped page.
+
+**Empty dirs are normal on some servers.** ``frequent``, ``recent`` and
+``highest`` depend on the server tracking play counts / ratings (Navidrome
+does); a server that does not will return an empty list, which renders as an
+empty dir, not an error. Network or server failures likewise yield an empty dir
+and never interrupt playback. Starred albums are intentionally not repeated here
+- they have their own **Starred** directory (below).
 
 
 Starred / loved content

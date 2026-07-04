@@ -17,6 +17,7 @@ class SubidyBackend(pykka.ThreadingActor, backend.Backend):
             legacy_auth=subidy_config["legacy_auth"],
             api_version=subidy_config["api_version"],
             radio_size=subidy_config["radio_size"],
+            album_list_size=subidy_config["album_list_size"],
         )
         self.library = library.SubidyLibraryProvider(backend=self)
         self.playback = playback.SubidyPlaybackProvider(

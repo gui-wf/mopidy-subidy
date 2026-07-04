@@ -27,6 +27,16 @@ MAX_LIST_RESULTS = 500
 # radio browse stays responsive.
 RADIO_SIZE_DEFAULT = 50
 
+# Number of albums a smart-list surface (Most Played, Recently Added, ...)
+# returns per browse - a single capped getAlbumList2 page. Configurable via the
+# `album_list_size` config key; this is the fallback when the key is absent or
+# empty. A distinct knob from radio_size (albums vs songs): 100 is a browsable
+# page without pulling the whole library, which get_raw_album_list would (and
+# which would defeat the `random` list by re-drawing on every page). The config
+# schema (config.Integer(minimum=1, maximum=500)) REJECTS out-of-range values
+# at load rather than clamping, matching getAlbumList2's 500-item size cap.
+ALBUM_LIST_SIZE_DEFAULT = 100
+
 # Stable cover-art size (px) requested from getCoverArt. Kept as a plain
 # constant rather than a config key to keep the extension's footprint small;
 # the value is baked into the image URL so a given track always yields the
@@ -106,11 +116,13 @@ class SubsonicApi:
         legacy_auth,
         api_version,
         radio_size=None,
+        album_list_size=None,
     ):
-        # radio_size may be None (config key absent/empty); coerce to the
-        # module default. A present value is already validated 1..500 by the
-        # config schema, so no clamping is needed here.
+        # radio_size / album_list_size may be None (config key absent/empty);
+        # coerce to the module default. A present value is already validated
+        # 1..500 by the config schema, so no clamping is needed here.
         self.radio_size = radio_size or RADIO_SIZE_DEFAULT
+        self.album_list_size = album_list_size or ALBUM_LIST_SIZE_DEFAULT
         parsed = urlparse(url)
         self.port = (
             parsed.port
@@ -896,10 +908,15 @@ class SubsonicApi:
                 % response.get("status")
             )
             return []
-        albums = response.get("albumList2").get("album")
-        if albums is not None:
-            return albums
-        return []
+        # A status-ok response may still omit or null the albumList2 container
+        # (e.g. frequent/recent/highest on a server with no play/rating data),
+        # so guard it - matching the sibling helpers (get_raw_similar_songs,
+        # get_raw_top_songs) - rather than chaining .get() and risking an
+        # AttributeError that would propagate out of browse(). _as_list also
+        # coerces a single album emitted as a bare object (not a one-element
+        # array) into a list, so callers never iterate a dict's keys.
+        album_list = response.get("albumList2") or {}
+        return _as_list(album_list.get("album"))
 
     def get_raw_album_list(self, ltype, size=MAX_LIST_RESULTS):
         """
@@ -925,6 +942,26 @@ class SubsonicApi:
             if artist_id is None
             else self.get_raw_albums(artist_id)
         )
+        return [self.raw_album_to_ref(album) for album in albums]
+
+    def get_album_list_as_refs(self, ltype, offset=0):
+        """One capped getAlbumList2 page as album refs (the smart-lists).
+
+        `ltype` is a getAlbumList2 type token (frequent/newest/recent/highest/
+        random). Reuses get_more_albums (single size-capped round-trip; NOT
+        get_raw_album_list, which loops to fetch the whole library and would
+        both hammer the server and defeat `random` by re-drawing each page) and
+        raw_album_to_ref, the same helper the existing Albums vdir uses - cover
+        art is NOT pre-cached here (only raw_album_to_album warms the cache), so
+        art resolves lazily via the get_cover_art_id_for_uri cold path (one
+        getAlbum per art query), identical to the existing Albums browse.
+
+        `offset` is available for a future paged caller; the default 0 returns
+        the first page. Resilient: get_more_albums logs and returns [] on any
+        network/server failure, so this never raises - a failed or empty list
+        renders as an empty dir.
+        """
+        albums = self.get_more_albums(ltype, self.album_list_size, offset)
         return [self.raw_album_to_ref(album) for album in albums]
 
     def get_albums_as_refs_from_raw(self, raw_artist):

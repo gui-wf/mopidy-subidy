@@ -11,6 +11,7 @@ SEARCH = "search"
 RANDOM = "random"
 SIMILAR = "similar"
 TOP = "top"
+LIST = "list"
 
 regex = re.compile(r"(\w+?):(\w+?)(?::|$)(.+?)?$")
 
@@ -85,6 +86,16 @@ def get_top_id(uri):
     return result.group(3)
 
 
+def get_list_type(uri):
+    # The LIST id is one of the fixed getAlbumList2 ltype tokens
+    # (frequent/newest/recent/highest/random) - all plain `\w+` words, so
+    # group(3) round-trips cleanly and a bare `subidy:list:` yields None.
+    result = regex.match(uri)
+    if not is_id_result_valid(result, LIST):
+        return None
+    return result.group(3)
+
+
 def get_vdir_id(uri):
     result = regex.match(uri)
     if not is_id_result_valid(result, VDIR):
@@ -137,3 +148,7 @@ def get_similar_uri(id):
 
 def get_top_uri(artist_name):
     return get_type_uri(TOP, artist_name)
+
+
+def get_list_uri(list_type):
+    return get_type_uri(LIST, list_type)

@@ -6,6 +6,22 @@ from mopidy_subidy import subsonic_api, uri
 
 logger = logging.getLogger(__name__)
 
+# The album smart-lists surfaced under the "Lists" vdir, in a fixed display
+# order. Each pair is (human name, getAlbumList2 ltype token). Starred is
+# intentionally absent - it already has its own top-level vdir and is
+# referenced, not duplicated. Note: `frequent`/`recent`/`highest` depend on the
+# server tracking play counts / ratings (Navidrome does); a server that does
+# not will simply return an empty dir here, never an error. Single source of
+# truth - _VALID_LIST_TYPES is derived from it so the two cannot drift.
+_ALBUM_LISTS = [
+    ("Most Played", "frequent"),
+    ("Recently Added", "newest"),
+    ("Recently Played", "recent"),
+    ("Highest Rated", "highest"),
+    ("Random", "random"),
+]
+_VALID_LIST_TYPES = frozenset(ltype for _, ltype in _ALBUM_LISTS)
+
 
 class SubidyLibraryProvider(backend.LibraryProvider):
     def __create_vdirs():
@@ -15,6 +31,7 @@ class SubidyLibraryProvider(backend.LibraryProvider):
             dict(id="albums", name="Albums"),
             dict(id="rootdirs", name="Directories"),
             dict(id="radio", name="Radio"),
+            dict(id="lists", name="Lists"),
             dict(id="random", name="Random Songs"),
             dict(id=subsonic_api.RESERVED_STARRED_ID, name="Starred"),
         ]
@@ -67,6 +84,20 @@ class SubidyLibraryProvider(backend.LibraryProvider):
         cached).
         """
         return [self._raw_vdir_to_ref(self._vdirs["random"])]
+
+    def browse_lists(self):
+        """List the album smart-lists under the top-level Lists dir.
+
+        A fixed, deterministically-ordered set of directory refs (see
+        _ALBUM_LISTS), each a subidy:list:<ltype> uri that browses into a
+        capped page of album refs on demand. Nothing is cached, so the Random
+        list is fresh per browse. Starred is deliberately omitted (it has its
+        own Starred vdir).
+        """
+        return [
+            Ref.directory(name=name, uri=uri.get_list_uri(ltype))
+            for name, ltype in _ALBUM_LISTS
+        ]
 
     def browse_artist(self, artist_id):
         """Browse an artist: two radio entries, then the albums.
@@ -161,6 +192,7 @@ class SubidyLibraryProvider(backend.LibraryProvider):
                 "artists",
                 "albums",
                 "radio",
+                "lists",
                 subsonic_api.RESERVED_STARRED_ID,
             ]
             root_vdirs = [
@@ -178,6 +210,8 @@ class SubidyLibraryProvider(backend.LibraryProvider):
             return self.browse_albums()
         elif browse_uri == uri.get_vdir_uri("radio"):
             return self.browse_radio()
+        elif browse_uri == uri.get_vdir_uri("lists"):
+            return self.browse_lists()
         elif browse_uri == uri.get_vdir_uri("random"):
             return self.browse_random_songs()
         elif browse_uri == uri.get_vdir_uri(subsonic_api.RESERVED_STARRED_ID):
@@ -204,6 +238,14 @@ class SubidyLibraryProvider(backend.LibraryProvider):
                 if top_id is None:
                     return []
                 return self.subsonic_api.get_top_songs_as_refs(top_id)
+            elif uri_type == uri.LIST:
+                # Guard a bare 'subidy:list:' (None) and any hand-crafted
+                # arbitrary ltype before it reaches the server; only the known
+                # tokens in _ALBUM_LISTS are ever passed to getAlbumList2.
+                list_type = uri.get_list_type(browse_uri)
+                if list_type not in _VALID_LIST_TYPES:
+                    return []
+                return self.subsonic_api.get_album_list_as_refs(list_type)
             else:
                 return []
 

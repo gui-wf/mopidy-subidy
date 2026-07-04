@@ -6,6 +6,17 @@ Changelog
 Unreleased
 ==========
 
+- Add album smart-lists as browsable directories under a top-level ``Lists``
+  dir, each backed by ``getAlbumList2``: ``Most Played`` (frequent),
+  ``Recently Added`` (newest), ``Recently Played`` (recent), ``Highest Rated``
+  (highest) and ``Random``. Each returns an ``album_list_size``-capped page of
+  real album refs that browse into their tracks via the existing album path.
+  Starred is referenced (its own dir), not duplicated. Random is re-drawn per
+  browse. Network/empty responses are logged and yield an empty dir - playback
+  is never interrupted. New ``album_list_size`` config key (default 100, range
+  1-500). Also hardens ``getAlbumList2`` handling against a null/absent
+  ``albumList2`` container.
+
 - Add algorithmic radio / instant-mix as browsable, queue-able content:
 
   - A top-level ``Radio`` browse dir with a ``Random Songs`` child backed by

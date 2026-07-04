@@ -32,6 +32,15 @@ class SubidyExtension(ext.Extension):
         schema["radio_size"] = config.Integer(
             optional=True, minimum=1, maximum=500
         )
+        # Number of albums each smart-list surface (Most Played, Recently
+        # Added, ...) returns per browse. getAlbumList2 caps size at 500;
+        # Integer(optional=True, ...) REJECTS an out-of-range value at load (it
+        # does not clamp). ext.conf ships a default of 100, so the value is
+        # effectively always present. Distinct from radio_size (albums vs
+        # songs), hence the larger default.
+        schema["album_list_size"] = config.Integer(
+            optional=True, minimum=1, maximum=500
+        )
         return schema
 
     def setup(self, registry):
