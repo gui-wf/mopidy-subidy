@@ -12,6 +12,7 @@ RANDOM = "random"
 SIMILAR = "similar"
 TOP = "top"
 LIST = "list"
+GENRE = "genre"
 
 regex = re.compile(r"(\w+?):(\w+?)(?::|$)(.+?)?$")
 
@@ -96,6 +97,23 @@ def get_list_type(uri):
     return result.group(3)
 
 
+def get_genre_name(uri):
+    # The GENRE id is a literal genre NAME (getSongsByGenre takes the name
+    # string returned by getGenres, not an id). Group 3 is captured verbatim -
+    # the module regex's second `:` is the only delimiter, so names containing
+    # colons, spaces, slashes, ampersands or percent signs (e.g. "Drum & Bass",
+    # "Hip-Hop/Rap", "Rock: Progressive", "100% Electronic") round-trip intact
+    # without any quoting, identical to the verified TOP handling. (A genre name
+    # containing a literal newline is the one exception - the module regex's `.`
+    # does not span newlines without DOTALL, so group(3) fails to match and this
+    # returns None; no real Subsonic server emits newline genre names, so this
+    # degrades safely to an empty dir rather than raising.)
+    result = regex.match(uri)
+    if not is_id_result_valid(result, GENRE):
+        return None
+    return result.group(3)
+
+
 def get_vdir_id(uri):
     result = regex.match(uri)
     if not is_id_result_valid(result, VDIR):
@@ -152,3 +170,7 @@ def get_top_uri(artist_name):
 
 def get_list_uri(list_type):
     return get_type_uri(LIST, list_type)
+
+
+def get_genre_uri(genre_name):
+    return get_type_uri(GENRE, genre_name)

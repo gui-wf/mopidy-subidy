@@ -41,6 +41,13 @@ class SubidyExtension(ext.Extension):
         schema["album_list_size"] = config.Integer(
             optional=True, minimum=1, maximum=500
         )
+        # Number of songs each genre surface returns per browse. getSongsByGenre
+        # caps count at 500; Integer(optional=True, ...) REJECTS an out-of-range
+        # value at load (it does not clamp). ext.conf ships a default of 100, so
+        # the value is effectively always present.
+        schema["genre_songs_size"] = config.Integer(
+            optional=True, minimum=1, maximum=500
+        )
         return schema
 
     def setup(self, registry):

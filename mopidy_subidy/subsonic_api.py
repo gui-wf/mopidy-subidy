@@ -37,6 +37,14 @@ RADIO_SIZE_DEFAULT = 50
 # at load rather than clamping, matching getAlbumList2's 500-item size cap.
 ALBUM_LIST_SIZE_DEFAULT = 100
 
+# Number of songs each genre browse returns per browse - a single capped
+# getSongsByGenre page. Configurable via the `genre_songs_size` config key;
+# this is the fallback when the key is absent or empty. getSongsByGenre caps
+# count at 500; the config schema (config.Integer(minimum=1, maximum=500))
+# REJECTS out-of-range values at load rather than clamping. A single capped
+# page keeps a genre browse responsive rather than looping the whole genre.
+GENRE_SONGS_SIZE_DEFAULT = 100
+
 # Stable cover-art size (px) requested from getCoverArt. Kept as a plain
 # constant rather than a config key to keep the extension's footprint small;
 # the value is baked into the image URL so a given track always yields the
@@ -69,13 +77,16 @@ def ref_sort_key(ref):
 
 
 def _as_list(value):
-    """Coerce a getStarred2 sub-value into a real list.
+    """Coerce a Subsonic list-or-bare-object sub-value into a real list of dicts.
 
-    py-sonic does no list normalization (``_doInfoReq`` returns the raw parsed
-    JSON), and a server that emits a single starred song/album/artist as a bare
-    object rather than a one-element array would otherwise make the callers
-    iterate a dict's keys (strings) and pass them to ``raw_*_to_ref``, raising
-    AttributeError. This guarantees every element handed onward is a dict.
+    Used across every list-shaped payload (getStarred2, getSimilarSongs2,
+    getTopSongs, getAlbumList2, getGenres, getSongsByGenre). py-sonic does no
+    list normalization (``_doInfoReq`` returns the raw parsed JSON), and a
+    server that emits a single element (e.g. one starred song, one genre) as a
+    bare object rather than a one-element array would otherwise make the callers
+    iterate a dict's keys (strings) and pass them to ``raw_*_to_ref`` /
+    ``get_genre_uri``, raising AttributeError. This guarantees every element
+    handed onward is a dict.
     """
     if value is None:
         return []
@@ -117,12 +128,15 @@ class SubsonicApi:
         api_version,
         radio_size=None,
         album_list_size=None,
+        genre_songs_size=None,
     ):
-        # radio_size / album_list_size may be None (config key absent/empty);
-        # coerce to the module default. A present value is already validated
-        # 1..500 by the config schema, so no clamping is needed here.
+        # radio_size / album_list_size / genre_songs_size may be None (config
+        # key absent/empty); coerce to the module default. A present value is
+        # already validated 1..500 by the config schema, so no clamping is
+        # needed here.
         self.radio_size = radio_size or RADIO_SIZE_DEFAULT
         self.album_list_size = album_list_size or ALBUM_LIST_SIZE_DEFAULT
+        self.genre_songs_size = genre_songs_size or GENRE_SONGS_SIZE_DEFAULT
         parsed = urlparse(url)
         self.port = (
             parsed.port
@@ -888,6 +902,92 @@ class SubsonicApi:
             for ref in (
                 self.raw_song_to_ref(song)
                 for song in self.get_raw_top_songs(artist_name)
+            )
+            if ref is not None
+        ]
+
+    def get_raw_genres(self):
+        """Return the getGenres genre list.
+
+        Each entry is a dict with the human-readable name in the ``value`` key
+        (the Subsonic/OpenSubsonic mapping of the <genre> element's text) plus
+        songCount/albumCount. On any failure (network, unsupported server older
+        than 1.9.0, non-ok status) it logs and returns []. Note: py-sonic's
+        _checkStatus raises only on status=='failed'; a missing/other status
+        returns None WITHOUT raising, so the status guard below is a real guard,
+        not dead code. The result is run through _as_list because some servers
+        emit a single genre as a bare object, not a one-element array.
+        """
+        try:
+            response = self.connection.getGenres()
+        except Exception:
+            logger.warning(
+                "Connecting to subsonic failed when loading genres."
+            )
+            return []
+        if response.get("status") != RESPONSE_OK:
+            logger.warning(
+                "Got non-okay status code from subsonic: %s"
+                % response.get("status")
+            )
+            return []
+        # genres may be absent OR present-but-None on a status-ok empty
+        # response; guard the chained .get so it never raises AttributeError.
+        genres = response.get("genres") or {}
+        return _as_list(genres.get("genre"))
+
+    def get_genres_as_refs(self):
+        refs = []
+        for genre in self.get_raw_genres():
+            # The genre name lives in the 'value' key per the Subsonic spec;
+            # fall back to 'name' for server/serializer variants that key it
+            # differently. Skip non-string or whitespace-only values (a
+            # malformed server could emit a number or blank). Use the name
+            # VERBATIM for both display and the uri: getSongsByGenre matches on
+            # the exact server name, so stripping it would break the round-trip.
+            name = genre.get("value") or genre.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            refs.append(
+                Ref.directory(name=name, uri=uri.get_genre_uri(name))
+            )
+        return refs
+
+    def get_raw_songs_by_genre(self, genre_name, offset=0):
+        """Return the getSongsByGenre song list for a genre NAME.
+
+        `genre_name` is the genre name string as returned by getGenres. Same
+        resilience and single-object-not-a-list coercion as get_raw_top_songs.
+        `offset` is available for a future paged caller; browse() fetches only
+        page 0, a single capped page (self.genre_songs_size) kept responsive
+        rather than looping the whole genre.
+        """
+        try:
+            response = self.connection.getSongsByGenre(
+                genre_name, self.genre_songs_size, offset
+            )
+        except Exception:
+            logger.warning(
+                "Connecting to subsonic failed when loading songs by genre."
+            )
+            return []
+        if response.get("status") != RESPONSE_OK:
+            logger.warning(
+                "Got non-okay status code from subsonic: %s"
+                % response.get("status")
+            )
+            return []
+        # songsByGenre may be absent OR present-but-None on a status-ok empty
+        # response; guard the chained .get so it never raises AttributeError.
+        payload = response.get("songsByGenre") or {}
+        return _as_list(payload.get("song"))
+
+    def get_songs_by_genre_as_refs(self, genre_name, offset=0):
+        return [
+            ref
+            for ref in (
+                self.raw_song_to_ref(song)
+                for song in self.get_raw_songs_by_genre(genre_name, offset)
             )
             if ref is not None
         ]

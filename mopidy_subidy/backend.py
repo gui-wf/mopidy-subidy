@@ -18,6 +18,7 @@ class SubidyBackend(pykka.ThreadingActor, backend.Backend):
             api_version=subidy_config["api_version"],
             radio_size=subidy_config["radio_size"],
             album_list_size=subidy_config["album_list_size"],
+            genre_songs_size=subidy_config["genre_songs_size"],
         )
         self.library = library.SubidyLibraryProvider(backend=self)
         self.playback = playback.SubidyPlaybackProvider(

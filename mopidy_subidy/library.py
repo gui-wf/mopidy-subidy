@@ -32,6 +32,7 @@ class SubidyLibraryProvider(backend.LibraryProvider):
             dict(id="rootdirs", name="Directories"),
             dict(id="radio", name="Radio"),
             dict(id="lists", name="Lists"),
+            dict(id="genres", name="Genres"),
             dict(id="random", name="Random Songs"),
             dict(id=subsonic_api.RESERVED_STARRED_ID, name="Starred"),
         ]
@@ -74,6 +75,16 @@ class SubidyLibraryProvider(backend.LibraryProvider):
 
     def browse_random_songs(self):
         return self.subsonic_api.get_random_songs_as_refs()
+
+    def browse_genres(self):
+        """List all genres under the top-level Genres dir.
+
+        One directory ref per genre (getGenres), each a subidy:genre:<name> uri
+        that browses into that genre's songs on demand. Resilient: the helper
+        logs and returns [] on any network/server failure, so the dir is simply
+        empty - never an error.
+        """
+        return self.subsonic_api.get_genres_as_refs()
 
     def browse_radio(self):
         """List the algorithmic-radio surfaces under the top-level Radio dir.
@@ -193,6 +204,7 @@ class SubidyLibraryProvider(backend.LibraryProvider):
                 "albums",
                 "radio",
                 "lists",
+                "genres",
                 subsonic_api.RESERVED_STARRED_ID,
             ]
             root_vdirs = [
@@ -212,6 +224,8 @@ class SubidyLibraryProvider(backend.LibraryProvider):
             return self.browse_radio()
         elif browse_uri == uri.get_vdir_uri("lists"):
             return self.browse_lists()
+        elif browse_uri == uri.get_vdir_uri("genres"):
+            return self.browse_genres()
         elif browse_uri == uri.get_vdir_uri("random"):
             return self.browse_random_songs()
         elif browse_uri == uri.get_vdir_uri(subsonic_api.RESERVED_STARRED_ID):
@@ -246,6 +260,13 @@ class SubidyLibraryProvider(backend.LibraryProvider):
                 if list_type not in _VALID_LIST_TYPES:
                     return []
                 return self.subsonic_api.get_album_list_as_refs(list_type)
+            elif uri_type == uri.GENRE:
+                # A hand-crafted bare 'subidy:genre:' yields a None name; skip
+                # the fetch rather than call getSongsByGenre with None.
+                genre_name = uri.get_genre_name(browse_uri)
+                if genre_name is None:
+                    return []
+                return self.subsonic_api.get_songs_by_genre_as_refs(genre_name)
             else:
                 return []
 
@@ -344,6 +365,11 @@ class SubidyLibraryProvider(backend.LibraryProvider):
         return SearchResult(uri=uri.get_search_uri(artist_name), tracks=tracks)
 
     def get_distinct(self, field, query):
+        # `list genre` (MPD) is query-independent: return the full genre set
+        # from getGenres, before any search (which would be empty for a bare
+        # `list genre` and short-circuit to []).
+        if field == "genre":
+            return [ref.name for ref in self.browse_genres()]
         search_result = self.search(query)
         if not search_result:
             return []
