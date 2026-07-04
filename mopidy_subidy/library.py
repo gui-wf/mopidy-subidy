@@ -3,6 +3,7 @@ import logging
 from mopidy import backend
 from mopidy.models import Image, Ref, SearchResult
 from mopidy_subidy import subsonic_api, uri
+from mopidy_subidy.subsonic_api import _as_list
 
 logger = logging.getLogger(__name__)
 
@@ -331,28 +332,54 @@ class SubidyLibraryProvider(backend.LibraryProvider):
         self, artist_name, album_name, track_name
     ):
         tracks = self.search_by_artist_and_album(artist_name, album_name)
-        track = next(item for item in tracks.tracks if track_name in item.name)
-        return SearchResult(tracks=[track])
+        # search_by_artist_and_album never returns None now (find_artists
+        # yields [] on failure), but its tracks may be empty or contain no
+        # name match; next(..., None) avoids a StopIteration crash there.
+        match = next(
+            (
+                item
+                for item in (tracks.tracks or [])
+                if item.name and track_name in item.name
+            ),
+            None,
+        )
+        return SearchResult(tracks=[match] if match else [])
 
     def search_by_artist_and_album(self, artist_name, album_name):
-        artists = self.subsonic_api.find_raw(artist_name).get("artist")
-        if artists is None:
-            return None
+        # find_artists owns the raw search3 shape: [] on a None (network-fail)
+        # payload and a single-match bare dict coerced to a one-element list,
+        # so neither a network failure nor a lone artist crashes here (the old
+        # .find_raw(...).get("artist") raised AttributeError on a None result).
+        artists = self.subsonic_api.find_artists(artist_name)
         tracks = []
         for artist in artists:
-            for album in self.subsonic_api.get_raw_albums(artist.get("id")):
-                if album_name in album.get("name"):
+            # Partial server data: an artist/album dict may omit id or name.
+            # Skip malformed entries with .get() guards rather than raising a
+            # KeyError/TypeError - this search path must never crash on it.
+            artist_id = artist.get("id") if artist else None
+            if not artist_id:
+                continue
+            for album in _as_list(self.subsonic_api.get_raw_albums(artist_id)):
+                if not album:
+                    continue
+                album_id = album.get("id")
+                name = album.get("name")
+                if not album_id or not name:
+                    continue
+                if album_name in name:
                     tracks.extend(
-                        self.subsonic_api.get_songs_as_tracks(album.get("id"))
+                        self.subsonic_api.get_songs_as_tracks(album_id)
                     )
         return SearchResult(tracks=tracks)
 
     def search_by_artist(self, artist_name, exact):
-        result = self.subsonic_api.find_raw(artist_name)
-        if result is None:
-            return None
+        # find_artists coerces the raw search3 shape (None -> [], single-match
+        # bare dict -> one-element list), so a network failure yields an empty
+        # result and a single-artist match no longer iterates a dict's keys.
         tracks = []
-        for artist in result.get("artist"):
+        for artist in self.subsonic_api.find_artists(artist_name):
+            if not artist or not artist.get("id"):
+                continue
             if exact:
                 if not artist.get("name") == artist_name:
                     continue

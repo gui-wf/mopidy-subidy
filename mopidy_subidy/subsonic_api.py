@@ -97,6 +97,64 @@ def _as_list(value):
     return []
 
 
+def _int_or_none(value):
+    """Coerce a Subsonic numeric field to a non-negative int, else None.
+
+    Every integer-typed mopidy model field (track_no, disc_no, length,
+    bitrate, num_tracks, num_discs) is fields.Integer(min=0): the model
+    constructor raises TypeError on a non-int and ValueError on a negative.
+    Some servers/serializers emit these as strings ("13") or, when broken,
+    as garbage ("junk") or a negative. int() handles the string case;
+    anything non-numeric is swallowed to None, and a negative is dropped to
+    None as well so the value can never trip Integer(min=0)'s lower-bound
+    check inside the constructor (which is OUTSIDE any try/except at the call
+    site). Net effect: a single malformed field never kills a whole
+    track/album build (and thus a whole search result or browse page).
+    """
+    if value in (None, ""):
+        return None
+    try:
+        coerced = int(value)
+    except (ValueError, TypeError):
+        return None
+    return coerced if coerced >= 0 else None
+
+
+def _str_or_none(value):
+    """Coerce a Subsonic string field to a non-empty str, else None.
+
+    Used for musicbrainz_id (fields.Identifier, which runs sys.intern and so
+    raises TypeError on a non-str) and comment (fields.String, which raises
+    TypeError on a non-str). A server that emits a numeric musicBrainzId, or
+    an empty string, must not crash the build: coerce truthy values with
+    str() and map everything falsy (None, "", 0) to None so the tag is simply
+    omitted rather than emitted empty or raising.
+    """
+    if not value:
+        return None
+    return str(value)
+
+
+def _year_to_date(year):
+    """Coerce a Subsonic ``year`` into a mopidy Date string, or None.
+
+    mopidy's Date is a String subclass that is currently NOT validated
+    (mopidy/models/fields.py), so the previous ``str(song.get("year"))`` bug
+    was invisible to validation yet very visible downstream: str(None) ==
+    "None" is truthy, so the ``or "none"`` fallback was dead and every
+    yearless song got the literal junk tag "None" shown in ncmpcpp. This maps
+    a falsy/garbage year to None (field omitted) and otherwise returns the
+    canonical 4-digit year string. Subsonic's ``year`` is spec'd as an
+    integer, so int() coercion is safe and drops non-numeric noise to None.
+    """
+    if not year:
+        return None
+    try:
+        return str(int(year))
+    except (ValueError, TypeError):
+        return None
+
+
 def string_nums_nocase_sort_key(s):
     segments = []
     for substr in re.split(r"(\d+)", s):
@@ -323,29 +381,55 @@ class SubsonicApi:
             return None
         return response.get("searchResult3")
 
-    def find_as_search_result(
-        self,
-        query,
-        exclude_artists=False,
-        exclude_albums=False,
-        exclude_songs=False,
-    ):
+    def find_artists(self, query):
+        """Return the artist matches for a query as a list of raw dicts.
+
+        A thin accessor that owns the raw search3 shape (None on failure ->
+        [], and a single-match bare dict coerced via _as_list) so library.py's
+        search helpers never reach into the searchResult3 payload directly.
+        """
+        raw = self.find_raw(query)
+        return _as_list(raw.get("artist")) if raw else []
+
+    def find_as_search_result(self, query):
         result = self.find_raw(query)
         if result is None:
             return None
+        # search3 serializes a single match as a bare dict, not a one-element
+        # list (verified in py-sonic's search3 docstring), so `or []` would let
+        # a lone artist/album/song through and the comprehension would iterate
+        # the dict's string keys into raw_*_to_* -> AttributeError. _as_list
+        # coerces every shape (None, bare dict, list) to a list of dicts.
+        #
+        # The raw_*_to_* builders return None for an id-less entry (an
+        # unplayable 'subidy:...:None' uri), so each list is filtered to drop
+        # those - a leaked None crashes downstream mopidy consumers that expect
+        # only model instances in SearchResult.tracks/albums/artists.
         return SearchResult(
             uri=uri.get_search_uri(query),
             artists=[
-                self.raw_artist_to_artist(artist)
-                for artist in result.get("artist") or []
+                artist
+                for artist in (
+                    self.raw_artist_to_artist(raw)
+                    for raw in _as_list(result.get("artist"))
+                )
+                if artist is not None
             ],
             albums=[
-                self.raw_album_to_album(album)
-                for album in result.get("album") or []
+                album
+                for album in (
+                    self.raw_album_to_album(raw)
+                    for raw in _as_list(result.get("album"))
+                )
+                if album is not None
             ],
             tracks=[
-                self.raw_song_to_track(song)
-                for song in result.get("song") or []
+                track
+                for track in (
+                    self.raw_song_to_track(raw)
+                    for raw in _as_list(result.get("song"))
+                )
+                if track is not None
             ],
         )
 
@@ -777,9 +861,14 @@ class SubsonicApi:
         """Extract and name-sort the album list from a raw artist object."""
         albums = artist.get("album") if artist is not None else None
         if albums is not None:
+            # Partial server data: an album may omit 'name'. Sort on "" for
+            # those rather than raising KeyError - callers guard the missing
+            # name/id themselves, so the malformed entry must survive the sort.
             return sorted(
-                albums,
-                key=lambda album: string_nums_nocase_sort_key(album["name"]),
+                _as_list(albums),
+                key=lambda album: string_nums_nocase_sort_key(
+                    album.get("name") or ""
+                ),
             )
         return []
 
@@ -1226,21 +1315,28 @@ class SubsonicApi:
         self._remember_cover_art_id(
             song_uri, song.get("coverArt") or song.get("id")
         )
+        duration = _int_or_none(song.get("duration"))
+        # bpm is intentionally NOT mapped: mopidy 3.4.2's Track model has no
+        # bpm field, so passing it would raise TypeError. Some OpenSubsonic
+        # servers do expose it; revisit if a future mopidy adds Track.bpm.
         return Track(
             name=song.get("title") or UNKNOWN_SONG,
             uri=song_uri,
-            bitrate=song.get("bitRate"),
-            track_no=int(song.get("track")) if song.get("track") else None,
-            date=str(song.get("year")) or "none",
-            genre=song.get("genre"),
-            length=(
-                int(song.get("duration")) * 1000
-                if song.get("duration")
+            bitrate=_int_or_none(song.get("bitRate")),
+            track_no=_int_or_none(song.get("track")),
+            date=_year_to_date(song.get("year")),
+            # Track.genre is fields.String and raises TypeError on a non-str;
+            # some servers emit genre as a list or number, so pass it only when
+            # it is actually a string (else omit the tag).
+            genre=(
+                song.get("genre")
+                if isinstance(song.get("genre"), str)
                 else None
             ),
-            disc_no=(
-                int(song.get("discNumber")) if song.get("discNumber") else None
-            ),
+            length=duration * 1000 if duration is not None else None,
+            disc_no=_int_or_none(song.get("discNumber")),
+            musicbrainz_id=_str_or_none(song.get("musicBrainzId")),
+            comment=_str_or_none(song.get("comment")),
             artists=[
                 Artist(
                     name=song.get("artist"),
@@ -1270,16 +1366,23 @@ class SubsonicApi:
         )
 
     def raw_album_to_album(self, album):
-        if album is None:
+        # Skip an album dict with no id (see raw_song_to_track) - a
+        # 'subidy:album:None' uri is unbrowsable.
+        if not album or not album.get("id"):
             return None
         album_uri = uri.get_album_uri(album.get("id"))
         # Pre-populate the cover-art cache (see raw_song_to_track).
         self._remember_cover_art_id(
             album_uri, album.get("coverArt") or album.get("id")
         )
+        # genre is intentionally NOT mapped: mopidy's Album model has no genre
+        # field (only Track does), so passing it would raise TypeError.
         return Album(
             name=album.get("title") or album.get("name") or UNKNOWN_ALBUM,
-            num_tracks=album.get("songCount"),
+            num_tracks=_int_or_none(album.get("songCount")),
+            num_discs=_int_or_none(album.get("discCount")),
+            date=_year_to_date(album.get("year")),
+            musicbrainz_id=_str_or_none(album.get("musicBrainzId")),
             uri=album_uri,
             artists=[
                 Artist(
@@ -1310,7 +1413,9 @@ class SubsonicApi:
         )
 
     def raw_artist_to_artist(self, artist):
-        if artist is None:
+        # Skip an artist dict with no id (see raw_song_to_track) - a
+        # 'subidy:artist:None' uri is unbrowsable.
+        if not artist or not artist.get("id"):
             return None
         return Artist(
             name=artist.get("name") or UNKNOWN_ARTIST,
