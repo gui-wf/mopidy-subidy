@@ -153,3 +153,33 @@ def test_bare_mock_connection_is_non_fatal():
     api = make_api(connection)
     assert api._opensubsonic_extensions == {}
     assert api.supports_extension("transcodeOffset") is False
+
+
+def test_negotiation_bounds_socket_timeout_and_restores():
+    # A no-timeout urllib call could stall startup ~2 min on a network blip.
+    # Negotiation must set a bounded socket default timeout during the call and
+    # restore the prior value afterwards, even when the request raises.
+    import socket
+
+    sentinel = object()
+    seen = {}
+
+    def raising_doinfo(_req):
+        seen["timeout_during"] = socket.getdefaulttimeout()
+        raise Exception("SSL EOF")
+
+    old = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(None)
+    try:
+        api = _api_with_negotiation(doinfo_side_effect=raising_doinfo)
+        # bounded to the constant during the call...
+        assert seen["timeout_during"] == (
+            subsonic_api.OPENSUBSONIC_NEGOTIATION_TIMEOUT
+        )
+        # ...and restored to the prior default afterwards (None here)
+        assert socket.getdefaulttimeout() is None
+        # failure is non-fatal: no extensions
+        assert api.supports_extension("anything") is False
+    finally:
+        socket.setdefaulttimeout(old)
+    _ = sentinel

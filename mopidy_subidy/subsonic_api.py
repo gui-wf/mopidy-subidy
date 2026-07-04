@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import socket
 import time
 from collections import OrderedDict
 from hashlib import md5
@@ -13,6 +14,9 @@ from mopidy_subidy import uri
 logger = logging.getLogger(__name__)
 
 RESPONSE_OK = "ok"
+# Bound the startup OpenSubsonic-extension negotiation so a network/TLS blip
+# cannot stall mopidy startup on the OS TCP timeout (~2 min).
+OPENSUBSONIC_NEGOTIATION_TIMEOUT = 15
 UNKNOWN_SONG = "Unknown Song"
 UNKNOWN_ALBUM = "Unknown Album"
 UNKNOWN_ARTIST = "Unknown Artist"
@@ -363,6 +367,13 @@ class SubsonicApi:
         call through the private request path purely to avoid re-implementing
         the URL/serverPath assembly, not for its auth handling.
         """
+        # py-sonic's urllib requests carry no timeout, so a network/TLS blip on
+        # this startup call would block __init__ on the OS TCP timeout (~2 min)
+        # and stall the whole mopidy startup (MPD never binds). Bound it with a
+        # scoped socket default timeout, restored in finally. Safe here: __init__
+        # runs single-threaded at startup before the pykka network actors spawn.
+        _old_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(OPENSUBSONIC_NEGOTIATION_TIMEOUT)
         try:
             req = self.connection._getRequest(
                 "getOpenSubsonicExtensions.view"
@@ -375,6 +386,8 @@ class SubsonicApi:
                 e,
             )
             return
+        finally:
+            socket.setdefaulttimeout(_old_timeout)
         # ``_doInfoReq`` returns ``dres['subsonic-response']`` verbatim without
         # a type check, so a malformed body (e.g. ``{"subsonic-response":
         # null}`` or a non-object envelope) yields a non-dict here. Guard before
